@@ -1,7 +1,7 @@
 import { existsSync } from "fs";
 import { run, runLive } from "./exec.ts";
 import { detectPlatform } from "./platform.ts";
-import { ensureAvd, listAvds, resolveDeviceProfile, startEmulator } from "./avd.ts";
+import { ensureAvd, killEmulator, listAvds, resolveDeviceProfile, startEmulator } from "./avd.ts";
 import { avdmanagerPath, emulatorPath, ensureSdk, sdkmanagerPath } from "./sdk.ts";
 import { findAdb } from "./adb.ts";
 import { DEFAULTS, loadConfig, printConfig } from "./config.ts";
@@ -98,8 +98,8 @@ function waitForBoot(adbPath: string, serial: string, timeoutSec: number): void 
   throw new Error(`${serial} did not finish booting within ${timeoutSec}s.`);
 }
 
-function startSourceEmulator(emuPath: string, avdName: string, platformType: string): void {
-  const args = ["-avd", avdName, "-no-boot-anim", "-no-audio", "-gpu", "host"];
+function startSourceEmulator(emuPath: string, avdName: string, platformType: string, gpuMode: string): void {
+  const args = ["-avd", avdName, "-no-boot-anim", "-no-audio", "-gpu", gpuMode];
   log.info(`Starting source emulator: ${avdName}`);
   if (platformType === "windows") {
     const argStr = args.map(arg => `'${arg}'`).join(",");
@@ -162,19 +162,39 @@ export async function bootstrapLab(labRoot: string, argv: string[] = process.arg
   adb.startServer();
   const emulatorAlreadyUp = !!adb.getEmulator();
 
+  let weStartedIt = false;
   if (!emulatorAlreadyUp && !cfg.skipEmulator) {
     await startEmulator(cfg, platform);
     Bun.sleepSync(2_000);
+    weStartedIt = true;
   } else if (emulatorAlreadyUp) {
     log.good(`Target emulator already connected: ${cfg.targetSerial}`);
   } else {
     log.warn("--skip-emulator set and target emulator is not connected.");
   }
-  adb.waitForBoot(cfg.emulatorBootTimeoutSec);
+
+  try {
+    adb.waitForBoot(cfg.emulatorBootTimeoutSec);
+  } catch (error) {
+    // A boot timeout right after we launched the emulator ourselves is
+    // consistent with a GPU-init failure (black screen) rather than a slow
+    // cold boot — this is the same class of failure the emulator's own
+    // "-gpu auto" is supposed to sidestep, but some VM hosts still need an
+    // explicit push to software rendering. Retry exactly once before
+    // surfacing the original error, so a genuinely broken setup still fails
+    // fast instead of retrying forever.
+    if (!weStartedIt || cfg.gpuMode === "swiftshader_indirect") throw error;
+    log.warn("Emulator boot timed out — retrying once with software rendering (-gpu swiftshader_indirect), common on VMs like VMware…");
+    killEmulator(adb.exePath, cfg.targetSerial);
+    Bun.sleepSync(3_000);
+    await startEmulator(cfg, platform, "swiftshader_indirect");
+    Bun.sleepSync(2_000);
+    adb.waitForBoot(cfg.emulatorBootTimeoutSec);
+  }
 
   log.step("Root");
   adb.verifyRoot();
-  const fridaVersion = await ensureFridaHost(cfg);
+  const fridaVersion = await ensureFridaHost(cfg, platform);
   log.step("frida-server");
   const abi = adb.getAbi();
   log.info(`Device ABI: ${abi}`);
@@ -219,20 +239,35 @@ export async function initializeLab(labRoot: string, argv: string[]): Promise<vo
   if (isOnline(adb.exePath, options.sourceSerial)) {
     log.good(`Source emulator already connected: ${options.sourceSerial}`);
   } else {
-    startSourceEmulator(emuPath, options.sourceAvd, platform.type);
-    waitForBoot(adb.exePath, options.sourceSerial, options.timeoutSec);
+    startSourceEmulator(emuPath, options.sourceAvd, platform.type, cfg.gpuMode);
+    try {
+      waitForBoot(adb.exePath, options.sourceSerial, options.timeoutSec);
+    } catch (error) {
+      // Same GPU-init-failure retry as the target emulator in bootstrapLab().
+      if (cfg.gpuMode === "swiftshader_indirect") throw error;
+      log.warn("Source emulator boot timed out — retrying once with software rendering (-gpu swiftshader_indirect), common on VMs like VMware…");
+      killEmulator(adb.exePath, options.sourceSerial);
+      Bun.sleepSync(3_000);
+      startSourceEmulator(emuPath, options.sourceAvd, platform.type, "swiftshader_indirect");
+      waitForBoot(adb.exePath, options.sourceSerial, options.timeoutSec);
+    }
   }
   log.good("Both lab emulator roles are initialized.");
 }
 
 export async function runE2E(labRoot: string, argv: string[]): Promise<void> {
-  const runOnlyFlags = new Set(["--package", "--apk", "--main-activity", "--frida-script", "--burp-cert", "--no-burp", "--spawn", "--verbose", "-v"]);
+  const runOnlyFlags = new Set([
+    "--package", "--apk", "--main-activity", "--frida-script",
+    "--burp-cert", "--proxy-cert", "--no-burp", "--no-proxy", "--proxy-tool",
+    "--spawn", "--verbose", "-v",
+  ]);
+  const runOnlyFlagsWithValue = ["--package", "--apk", "--main-activity", "--frida-script", "--burp-cert", "--proxy-cert", "--proxy-tool"];
   const initArgs: string[] = [];
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index];
     const key = arg.split("=", 1)[0];
     if (runOnlyFlags.has(key)) {
-      if (!arg.includes("=") && ["--package", "--apk", "--main-activity", "--frida-script", "--burp-cert"].includes(arg)) index++;
+      if (!arg.includes("=") && runOnlyFlagsWithValue.includes(arg)) index++;
       continue;
     }
     initArgs.push(arg);
@@ -252,7 +287,7 @@ Android Pentest Lab - lab command
 Usage
   bun run init -- [options]       Initialize target and source emulators
   bun run bootstrap -- [options]  Bootstrap only the rooted target
-  bun run e2e -- --package=<pkg>  Initialize, install, Burp, launch, and Frida
+  bun run e2e -- --package=<pkg>  Initialize, install, proxy (Burp by default), launch, and Frida
 
 The transfer workflow is available as: bun run transfer -- --package=<pkg>
 `);

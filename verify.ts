@@ -22,7 +22,7 @@ import { log, fail } from "./src/log.ts";
 import { detectPlatform } from "./src/platform.ts";
 import { loadConfig } from "./src/config.ts";
 import { findAdb } from "./src/adb.ts";
-import { getHostFridaVersion } from "./src/frida.ts";
+import { activatePortablePython, getHostFridaVersion } from "./src/frida.ts";
 import { run } from "./src/exec.ts";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -46,6 +46,7 @@ async function main(): Promise<void> {
   const labRoot  = import.meta.dir;
   const platform = detectPlatform();
   const cfg      = loadConfig(labRoot);
+  activatePortablePython(cfg);
 
   console.log("\n\x1b[1m╔══════════════════════════════════════╗\x1b[0m");
   console.log(  "\x1b[1m║    Android Pentest Lab — Verify      ║\x1b[0m");
@@ -171,7 +172,7 @@ async function main(): Promise<void> {
     }
   }
 
-  // ── 7. Burp proxy setting ──────────────────────────────────────────────────
+  // ── 7. Proxy setting (Burp by default) ─────────────────────────────────────
   console.log("\n\x1b[1m── Proxy ────────────────────────────────\x1b[0m");
 
   const proxyVal = adb.shell("settings get global http_proxy 2>/dev/null || true").trim();

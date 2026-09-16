@@ -1,5 +1,5 @@
 // ── Download + extract helpers ────────────────────────────────────────────────
-import { mkdirSync, existsSync, copyFileSync, unlinkSync, createWriteStream } from "fs";
+import { mkdirSync, existsSync, copyFileSync, unlinkSync, createWriteStream, readdirSync, renameSync, statSync } from "fs";
 import { dirname, basename, join } from "path";
 import { log } from "./log.ts";
 import { run, runLive } from "./exec.ts";
@@ -11,6 +11,14 @@ import type { LabConfig } from "./config.ts";
 /**
  * Download `url` to `destPath`, showing a progress bar.
  * Skips the download if the file already exists (cache-friendly).
+ *
+ * Retries a few times on a transient network drop mid-stream (observed
+ * directly against both GitHub release assets and Adoptium's redirected
+ * binary endpoint: "ECONNRESET"/"socket connection was closed unexpectedly"
+ * partway through a large file) — a bare failure here previously aborted
+ * the whole bootstrap on what's usually just a one-off network hiccup, with
+ * no way to resume short of deleting the (incomplete, silently accepted as
+ * "cached" by the existsSync() check above) partial file by hand.
  */
 export async function downloadFile(url: string, destPath: string): Promise<void> {
   if (existsSync(destPath)) {
@@ -19,6 +27,22 @@ export async function downloadFile(url: string, destPath: string): Promise<void>
   }
 
   mkdirSync(dirname(destPath), { recursive: true });
+
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await downloadFileOnce(url, destPath);
+      return;
+    } catch (e) {
+      if (existsSync(destPath)) unlinkSync(destPath); // never leave a partial file behind
+      if (attempt >= 4) throw e;
+      const message = e instanceof Error ? e.message : String(e);
+      log.warn(`Download interrupted (${message}) — retrying (${attempt}/3)…`);
+      Bun.sleepSync(2_000);
+    }
+  }
+}
+
+async function downloadFileOnce(url: string, destPath: string): Promise<void> {
   log.info(`Downloading ${basename(destPath)}`);
   log.info(`  → ${url}`);
 
@@ -36,22 +60,23 @@ export async function downloadFile(url: string, destPath: string): Promise<void>
   const reader  = resp.body!.getReader();
   let received  = 0;
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    await new Promise<void>((resolve, reject) => {
-      fh.write(value, (err) => (err ? reject(err) : resolve()));
-    });
-    received += value.length;
-    if (total > 0) {
-      const pct = Math.round((received / total) * 100);
-      process.stdout.write(`\r  ${pct}%  (${mb(received)} / ${mb(total)} MB)   `);
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      await new Promise<void>((resolve, reject) => {
+        fh.write(value, (err) => (err ? reject(err) : resolve()));
+      });
+      received += value.length;
+      if (total > 0) {
+        const pct = Math.round((received / total) * 100);
+        process.stdout.write(`\r  ${pct}%  (${mb(received)} / ${mb(total)} MB)   `);
+      }
     }
+  } finally {
+    process.stdout.write("\n");
+    await new Promise<void>((resolve) => fh.close(() => resolve()));
   }
-  await new Promise<void>((resolve, reject) => {
-    fh.close((err) => (err ? reject(err) : resolve()));
-  });
-  process.stdout.write("\n");
   log.good(`Saved: ${destPath}`);
 }
 
@@ -70,6 +95,7 @@ export async function extractXz(
   archivePath: string,
   outDir: string,
   platform: PlatformInfo,
+  cfg?: LabConfig,
 ): Promise<string> {
   mkdirSync(outDir, { recursive: true });
   const outFile = join(outDir, basename(archivePath).replace(/\.xz$/, ""));
@@ -82,7 +108,7 @@ export async function extractXz(
   log.info(`Extracting ${basename(archivePath)}…`);
 
   if (platform.type === "windows") {
-    const z = find7z();
+    const z = find7z(cfg?.portable ? cfg : undefined);
     // Same transient-lock retry as extractZip() below — frida-server's .xz
     // is just as susceptible to a fresh-download antivirus lock.
     let r = run(z, ["x", archivePath, `-o${outDir}`, "-y"]);
@@ -120,6 +146,7 @@ export function extractZip(
   archivePath: string,
   outDir: string,
   platform: PlatformInfo,
+  cfg?: LabConfig,
 ): void {
   mkdirSync(outDir, { recursive: true });
   log.info(`Extracting ${basename(archivePath)}…`);
@@ -130,7 +157,7 @@ export function extractZip(
     // (antivirus real-time scan, or the OS not yet having released the
     // write handle) — retry a few times with a short backoff instead of
     // failing the whole SDK install on a transient lock.
-    const z7 = try7z();
+    const z7 = try7z(cfg?.portable ? cfg : undefined);
     const attempt = () => z7
       ? run(z7, ["x", archivePath, `-o${outDir}`, "-y"])
       : run("powershell", [
@@ -162,9 +189,74 @@ export function extractZip(
   log.good(`Extracted to: ${outDir}`);
 }
 
+/**
+ * Extract a zip that wraps its real content in a single top-level versioned
+ * folder (e.g. Temurin JRE zips extract as "jdk-21.0.5+11-jre/bin/...") and
+ * flatten that folder's contents directly into `destDir`, so callers get a
+ * stable path (`destDir/bin/java.exe`) regardless of the exact version
+ * string baked into the archive's folder name. If the archive extracts flat
+ * (no single wrapping folder — e.g. Python's embeddable zip), its contents
+ * are used as-is.
+ */
+export function extractZipFlattenRoot(
+  archivePath: string,
+  destDir: string,
+  platform: PlatformInfo,
+  cfg?: LabConfig,
+): void {
+  const tmpDir = `${destDir}_tmp_extract`;
+  mkdirSync(tmpDir, { recursive: true });
+  extractZip(archivePath, tmpDir, platform, cfg);
+
+  const entries = readdirSync(tmpDir);
+  const sourceDir = entries.length === 1 && statSync(join(tmpDir, entries[0])).isDirectory()
+    ? join(tmpDir, entries[0])
+    : tmpDir;
+
+  mkdirSync(destDir, { recursive: true });
+  for (const entry of readdirSync(sourceDir)) {
+    const from = join(sourceDir, entry);
+    const to = join(destDir, entry);
+    // Same transient-lock class as elsewhere in this file — a few retries
+    // instead of failing the whole install on a fresh-extract race.
+    for (let i = 0; ; i++) {
+      try {
+        renameSync(from, to);
+        break;
+      } catch (e) {
+        const isLock = e instanceof Error && /EPERM|EBUSY/.test((e as NodeJS.ErrnoException).code ?? "");
+        if (!isLock || i >= 5) throw e;
+        Bun.sleepSync(1_500);
+      }
+    }
+  }
+
+  run("rm", ["-rf", tmpDir]);
+  run("powershell", ["-NoProfile", "-Command", `Remove-Item -Recurse -Force '${tmpDir}'`]);
+}
+
 // ── 7-Zip helpers (Windows / WSL) ────────────────────────────────────────────
 
-function try7z(): string | null {
+/** Where a portable 7za.exe lands when ensure7z() downloads it in --portable mode. */
+function portable7zPath(cfg?: LabConfig): string | null {
+  return cfg ? join(cfg.toolsDir, "7zip-portable", "7za.exe") : null;
+}
+
+/**
+ * Locate a usable 7-Zip executable.
+ *
+ * @param cfg  When passed with `portable: true`, ONLY the portable copy
+ *   under tools/7zip-portable/ is considered — the host's own 7-Zip (on
+ *   PATH or in Program Files), if any, is deliberately never used, per
+ *   --portable's "don't borrow the host's own installs" contract. Pass
+ *   `undefined` (or a non-portable cfg) for normal-mode lookup, which
+ *   checks PATH and the usual Program Files locations instead.
+ */
+function try7z(cfg?: LabConfig): string | null {
+  if (cfg?.portable) {
+    const portable = portable7zPath(cfg);
+    return portable && existsSync(portable) ? portable : null;
+  }
   if (run("7z", ["i"]).ok) return "7z";
   const candidates = [
     process.env.ProgramFiles       && `${process.env.ProgramFiles}\\7-Zip\\7z.exe`,
@@ -176,8 +268,8 @@ function try7z(): string | null {
   return candidates.find(p => existsSync(p)) ?? null;
 }
 
-function find7z(): string {
-  const p = try7z();
+function find7z(cfg?: LabConfig): string {
+  const p = try7z(cfg);
   if (!p) {
     throw new Error(
       "7-Zip is required on Windows. Install it with:\n" +
@@ -188,16 +280,40 @@ function find7z(): string {
 }
 
 /**
- * Ensure 7-Zip is available on Windows before it's needed, auto-installing
- * via winget when `--install-sdk` is set (same self-healing pattern as
- * ensureJava() in src/sdk.ts and the Python bootstrap in src/frida.ts).
- * No-op on non-Windows platforms, and a no-op if 7-Zip is already present
- * (extractZip() already has an Expand-Archive fallback for .zip, but there
- * is no fallback for .xz — frida-server's archive format — so this matters
- * even when only the .zip path would otherwise limp along without it).
+ * Ensure 7-Zip is available on Windows before it's needed.
+ *
+ * Two install strategies, chosen by `cfg.portable`:
+ *   - Normal mode: auto-installs the real 7-Zip via winget when
+ *     `--install-sdk` is set (same self-healing pattern as ensureJava() in
+ *     src/sdk.ts and the Python bootstrap in src/frida.ts). This is a
+ *     system-wide install.
+ *   - Portable mode: downloads the old standalone "7-Zip Command Line
+ *     Version" (7za.exe, a genuine .zip — not a .7z — so Expand-Archive can
+ *     extract it without any 7z dependency already existing) into
+ *     tools/7zip-portable/ and uses only that copy. Never touches the host's
+ *     own 7-Zip install (if any) and never calls winget.
+ *
+ * No-op if a usable 7z is already found for the active mode, and a no-op if
+ * `--install-sdk` isn't set in normal mode (extractZip() can still fall back
+ * to Expand-Archive for .zip; only frida-server's .xz has no fallback).
  */
 export async function ensure7z(cfg: LabConfig, platform: PlatformInfo): Promise<void> {
-  if (platform.type !== "windows" || try7z()) return;
+  if (platform.type !== "windows" || try7z(cfg.portable ? cfg : undefined)) return;
+
+  if (cfg.portable) {
+    log.info("7-Zip not found; downloading a portable copy (7za.exe) into tools/7zip-portable/…");
+    const dest = join(cfg.toolsDir, "7zip-portable");
+    mkdirSync(dest, { recursive: true });
+    const zipFile = join(cfg.cacheDir, "7za920.zip");
+    await downloadFile("https://www.7-zip.org/a/7za920.zip", zipFile);
+    extractZip(zipFile, dest, platform);
+    if (try7z(cfg)) {
+      log.good(`Portable 7-Zip ready: ${portable7zPath(cfg)}`);
+    } else {
+      log.warn("Portable 7-Zip download did not produce a usable 7za.exe; will fall back to Expand-Archive for .zip (frida-server's .xz has no fallback).");
+    }
+    return;
+  }
 
   if (!cfg.installSdk) return; // extractZip() can still fall back to Expand-Archive
 

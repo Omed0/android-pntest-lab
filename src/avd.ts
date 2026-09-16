@@ -205,17 +205,23 @@ function applyHardwareConfig(cfg: LabConfig): void {
  * On Linux/WSL/macOS: spawns with ignored stdio so the parent can exit freely.
  *
  * Returns the PID of the emulator process (best-effort; 0 if not determinable).
+ *
+ * @param gpuModeOverride  Force a specific `-gpu` mode instead of
+ *   `cfg.gpuMode` — used by the boot-timeout retry to force
+ *   "swiftshader_indirect" after a suspected GPU-init failure (black
+ *   screen), without changing the user's configured default.
  */
 export async function startEmulator(
   cfg: LabConfig,
   platform: PlatformInfo,
+  gpuModeOverride?: string,
 ): Promise<number> {
   const emuPath = emulatorPath(cfg.sdkRoot, platform);
   const args = [
     "-avd",         cfg.avdName,
     "-no-boot-anim",
     "-no-audio",
-    "-gpu",         "host",
+    "-gpu",         gpuModeOverride ?? cfg.gpuMode,
   ];
 
   log.info(`Launching emulator: ${cfg.avdName}`);
@@ -239,4 +245,15 @@ export async function startEmulator(
   });
   log.good(`Emulator started (PID=${proc.pid}).`);
   return proc.pid;
+}
+
+/**
+ * Ask a running emulator to shut down via its ADB console ("emu kill"),
+ * rather than tracking/killing an OS PID — works the same on every platform
+ * and doesn't care whether the process was launched via PowerShell
+ * Start-Process or Bun.spawn. Used by the boot-timeout GPU-mode retry.
+ * Best-effort: failures here are not fatal, the caller just relaunches.
+ */
+export function killEmulator(adbPath: string, serial: string): void {
+  run(adbPath, ["-s", serial, "emu", "kill"]);
 }

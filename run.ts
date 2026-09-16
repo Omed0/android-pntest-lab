@@ -27,6 +27,7 @@ import { detectPlatform } from "./src/platform.ts";
 import { DEFAULTS, loadConfig, printConfig } from "./src/config.ts";
 import { findAdb } from "./src/adb.ts";
 import {
+  activatePortablePython,
   getHostFridaVersion,
   getFridaServer,
   deployFridaServer,
@@ -44,6 +45,7 @@ interface RunOptions {
   sourceSerial: string;
   burpCert?: string;
   burp: boolean;
+  proxyTool: "burp" | "other";
   spawnMode: boolean;     // --spawn: use frida --spawn instead of attaching
   verbose: boolean;
 }
@@ -51,6 +53,7 @@ interface RunOptions {
 function parseRunArgs(argv: string[]): RunOptions {
   const opts: RunOptions = {
     burp:       true,
+    proxyTool:  "burp",
     spawnMode:  false,
     verbose:    false,
     sourceSerial: process.env.LAB_SOURCE_SERIAL ?? DEFAULTS.sourceSerial,
@@ -70,8 +73,11 @@ function parseRunArgs(argv: string[]): RunOptions {
       case "main-activity":  opts.mainActivity = val; break;
       case "frida-script":   opts.fridaScript  = val; break;
       case "source-serial":  opts.sourceSerial = val ?? opts.sourceSerial; break;
-      case "burp-cert":      opts.burpCert     = val; break;
-      case "no-burp":        opts.burp         = false; break;
+      case "burp-cert":
+      case "proxy-cert":     opts.burpCert     = val; break;
+      case "no-burp":
+      case "no-proxy":       opts.burp         = false; break;
+      case "proxy-tool":     opts.proxyTool    = val === "other" ? "other" : "burp"; break;
       case "spawn":          opts.spawnMode    = true; break;
       case "verbose":
       case "v":              opts.verbose       = true; break;
@@ -97,18 +103,24 @@ function printRunHelp(): void {
   --main-activity=<name>    Activity to start (default: resolved from package)
   --frida-script=<path>     Frida JS script to load (default: scripts/hook.js if it exists)
   --source-serial=<id>      Play Store source emulator for automatic package recovery
-  --burp-cert=<path>        Burp CA certificate (default: first cert in ./cert)
-  --no-burp                 Skip Burp proxy configuration on device
+  --proxy-cert=<path>       Proxy CA certificate (default: first cert in ./cert)
+                            (alias: --burp-cert)
+  --proxy-tool=<burp|other> Whether to auto-fetch the CA from http://burp/cert [burp]
+                            Set to "other" when using a non-Burp proxy tool —
+                            skips the Burp-only auto-download and goes straight
+                            to cert/ or --proxy-cert=<path>.
+  --no-proxy                Skip proxy configuration on device entirely
+                            (alias: --no-burp)
   --spawn                   Use frida --spawn instead of attaching to running process
   --verbose, -v             Print extra debug output
   --help, -h                Show this help
 
 \x1b[1mAll bootstrap options also apply\x1b[0m (passed through to config):
-  --avd-name, --sdk-root, --frida-version, --burp-host, --burp-port, ...
+  --avd-name, --sdk-root, --frida-version, --proxy-host, --proxy-port, ...
   Run \`bun run bootstrap -- --help\` for the full list.
 
 \x1b[1mExamples\x1b[0m
-  # Attach to an already-running app
+  # Attach to an already-running app (Burp is the default proxy)
   bun run.ts --package=com.example.app
 
   # Install APK first, then attach with a hook script
@@ -117,20 +129,24 @@ function printRunHelp(): void {
   # Spawn the app fresh (frida controls the lifecycle)
   bun run.ts --package=com.example.app --spawn --frida-script=./scripts/hook.js
 
-  # Skip Burp proxy setup
-  bun run.ts --package=com.example.app --no-burp
+  # Use a different proxy tool (e.g. mitmproxy) instead of Burp
+  bun run.ts --package=com.example.app --proxy-tool=other --proxy-host=10.0.2.2 --proxy-port=8080 --proxy-cert=./mitmproxy-ca.pem
+
+  # Skip proxy setup entirely
+  bun run.ts --package=com.example.app --no-proxy
 `);
 }
 
 // ── Burp proxy helpers ────────────────────────────────────────────────────────
 
 /**
- * Configure the emulator's global HTTP/HTTPS proxy to point at Burp.
+ * Configure the emulator's global HTTP/HTTPS proxy to point at the
+ * configured listener (Burp by default; any proxy tool works the same way).
  * Uses `adb shell settings put global http_proxy host:port`.
- * The emulator's default gateway 10.0.2.2 reaches the host machine's Burp listener.
+ * The emulator's default gateway 10.0.2.2 reaches the host machine.
  */
-function setBurpProxy(adb: ReturnType<typeof findAdb>, host: string, port: number): void {
-  log.step("Burp proxy");
+function setBurpProxy(adb: ReturnType<typeof findAdb>, host: string, port: number, proxyTool: "burp" | "other"): void {
+  log.step("Proxy");
   log.info(`Setting device proxy → ${host}:${port}`);
   adb.shell(`settings put global http_proxy ${host}:${port}`);
   const val = adb.shell("settings get global http_proxy");
@@ -139,8 +155,12 @@ function setBurpProxy(adb: ReturnType<typeof findAdb>, host: string, port: numbe
   } else {
     log.warn(`Proxy setting may not have taken effect (got: ${val})`);
   }
-  log.info("  Reminder: make sure Burp Suite is listening on all interfaces (0.0.0.0)");
-  log.info(`  Burp > Proxy > Proxy Listeners > Binding address = All interfaces, port ${port}`);
+  if (proxyTool === "burp") {
+    log.info("  Reminder: make sure Burp Suite is listening on all interfaces (0.0.0.0)");
+    log.info(`  Burp > Proxy > Proxy Listeners > Binding address = All interfaces, port ${port}`);
+  } else {
+    log.info(`  Reminder: make sure your proxy tool is listening on ${host}:${port} (all interfaces).`);
+  }
 }
 
 // ── APK install ───────────────────────────────────────────────────────────────
@@ -243,21 +263,32 @@ async function ensureBurpCertificate(
   burpHost: string,
   burpPort: number,
   requestedPath?: string,
+  proxyTool: "burp" | "other" = "burp",
 ): Promise<void> {
-  let certPath = findBurpCertificate(labRoot, requestedPath) ??
-    downloadBurpCertificate(labRoot, burpHost, burpPort);
+  // downloadBurpCertificate() only works for Burp's magic http://burp/cert
+  // endpoint — a different proxy tool (mitmproxy's http://mitm.it, etc.)
+  // wouldn't answer there, so skip straight to the manual/--proxy-cert path
+  // when the user has told us they're not using Burp.
+  const autoDownload = () => proxyTool === "burp" ? downloadBurpCertificate(labRoot, burpHost, burpPort) : null;
+
+  let certPath = findBurpCertificate(labRoot, requestedPath) ?? autoDownload();
   if (!certPath) {
-    log.warn("Burp CA was not found or could not be downloaded.");
-    log.info("Export Burp's CA from http://burp/cert and save it as cert/burp-ca.cer.");
-    log.info("Alternatively pass --burp-cert=<path> to use a certificate elsewhere.");
+    log.warn(proxyTool === "burp"
+      ? "Proxy CA was not found or could not be downloaded."
+      : "Proxy CA was not found under cert/.");
+    if (proxyTool === "burp") {
+      log.info("Export Burp's CA from http://burp/cert and save it as cert/burp-ca.cer.");
+    } else {
+      log.info("Export your proxy tool's CA certificate and save it under cert/ (any .cer/.crt/.der/.pem file).");
+    }
+    log.info("Alternatively pass --proxy-cert=<path> to use a certificate elsewhere.");
     const answer = prompt("After placing the certificate, type y to retry: ");
     if (answer?.trim().toLowerCase() !== "y") {
-      throw new Error("Burp CA setup cancelled. No certificate was provided.");
+      throw new Error("Proxy CA setup cancelled. No certificate was provided.");
     }
-    certPath = findBurpCertificate(labRoot, requestedPath) ??
-      downloadBurpCertificate(labRoot, burpHost, burpPort);
+    certPath = findBurpCertificate(labRoot, requestedPath) ?? autoDownload();
     if (!certPath) {
-      throw new Error("Burp CA is still missing. Save it under cert/ and rerun.");
+      throw new Error("Proxy CA is still missing. Save it under cert/ and rerun.");
     }
   }
 
@@ -409,6 +440,7 @@ async function main(): Promise<void> {
   const labRoot  = import.meta.dir;
   const platform = detectPlatform();
   const cfg      = loadConfig(labRoot);
+  activatePortablePython(cfg);
   const runOpts  = parseRunArgs(process.argv);
 
   // ── Header ─────────────────────────────────────────────────────────────────
@@ -480,12 +512,12 @@ async function main(): Promise<void> {
 
   verifyFridaConnection(cfg.targetSerial);
 
-  // ── 4. Burp proxy ──────────────────────────────────────────────────────────
+  // ── 4. Proxy (Burp by default) ─────────────────────────────────────────────
   if (runOpts.burp) {
-    setBurpProxy(adb, cfg.burpHost, cfg.burpPort);
-    await ensureBurpCertificate(adb, labRoot, platform, cfg.burpHost, cfg.burpPort, runOpts.burpCert);
+    setBurpProxy(adb, cfg.burpHost, cfg.burpPort, runOpts.proxyTool);
+    await ensureBurpCertificate(adb, labRoot, platform, cfg.burpHost, cfg.burpPort, runOpts.burpCert, runOpts.proxyTool);
   } else {
-    log.info("Burp proxy setup skipped (--no-burp).");
+    log.info("Proxy setup skipped (--no-proxy).");
   }
 
   // ── 5. APK install ─────────────────────────────────────────────────────────

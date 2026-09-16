@@ -54,6 +54,22 @@ Everything else below is either already automated or self-healing on
 | 7-Zip (Windows only) | Auto-installed via `winget install 7zip.7zip` with `--install-sdk`; `.zip` extraction still falls back to the built-in `Expand-Archive` if 7-Zip can't be installed, but `.xz` (frida-server's format) has no fallback and needs it. |
 | Android cmdline-tools / Platform-Tools / Emulator / system images | Downloaded and installed by `sdkmanager` under `--install-sdk`, cached under `tools/cache/`. |
 | Root | Auto-detected per device — see **Root: two kinds, handled automatically** below. Never silently attempts an arbitrary rooting exploit. |
+| Emulator GPU mode | Defaults to `-gpu auto` (safe on VMs like VMware, which usually can't offer real GPU passthrough — this replaced a previous hardcoded `-gpu host` that could show a black emulator window on such machines). A boot timeout also triggers one automatic retry with `-gpu swiftshader_indirect`. Override with `--gpu-mode=<mode>` if needed. |
+
+### Running fully portable (no system-wide installs at all)
+
+Pass `--portable` to any bootstrap command (`bun run init -- --portable
+--install-sdk`, etc.) to download Java, Python, and 7-Zip as private
+zip/portable copies under this project's own `tools/` directory instead of
+using `winget` or anything already on the host. This is for verifying (or
+running) the lab on a machine without touching its existing installs at
+all — even if the host already has its own Java/Python/7-Zip, `--portable`
+never uses them and never mutates system state (no `winget install`, no
+PATH/registry changes — only this process's own `PATH` is extended). The
+Android SDK/AVD also default to a private path under `tools/android-sdk`
+in this mode instead of the host's real SDK, unless you pass an explicit
+`--sdk-root`. Delete the `tools/` directory afterward to remove everything
+this mode downloaded.
 
 ### Root: two kinds, handled automatically
 
@@ -231,19 +247,33 @@ bun run verify
 Use `bun run help`, `bun run init -- --help`, or `bun run transfer -- --help`
 for command-specific options.
 
-## Burp and certificates
+## Proxy and certificates (Burp by default — any other tool also works)
 
 The runner sets the target's global Android proxy to the configured
-`LAB_BURP_HOST:LAB_BURP_PORT`. For this lab that is:
+`LAB_PROXY_HOST:LAB_PROXY_PORT` (the older `LAB_BURP_HOST`/`LAB_BURP_PORT`
+names still work as aliases for the same values). For this lab that is:
 
 ```text
-$env:LAB_BURP_HOST`:$env:LAB_BURP_PORT
+$env:LAB_PROXY_HOST`:$env:LAB_PROXY_PORT
 ```
 
-If `cert/` has no certificate, the runner requests Burp's CA through
-`http://burp/cert` using the configured listener and saves it as
-`cert/burp-ca.cer`. You may also place a `.cer`, `.crt`, `.der`, or `.pem` file
-there, or pass `--burp-cert=<path>`.
+Burp Suite is the default and needs no extra flags. If `cert/` has no
+certificate, the runner requests Burp's CA through `http://burp/cert` using
+the configured listener and saves it as `cert/burp-ca.cer`. You may also
+place a `.cer`, `.crt`, `.der`, or `.pem` file there yourself, or pass
+`--proxy-cert=<path>` (alias: `--burp-cert=<path>`).
+
+**Using a different proxy tool** (mitmproxy, etc.): pass
+`--proxy-tool=other` so the Burp-only `http://burp/cert` auto-download is
+skipped, along with `--proxy-host`/`--proxy-port` for your tool's listener
+and either a cert dropped in `cert/` or `--proxy-cert=<path>` for its CA:
+
+```powershell
+bun run.ts --package=<pkg> --proxy-tool=other --proxy-host=10.0.2.2 --proxy-port=8080 --proxy-cert=.\mitmproxy-ca.pem
+```
+
+**Using no proxy at all:** pass `--no-proxy` (alias: `--no-burp`) to skip
+proxy and certificate setup entirely.
 
 The rooted target receives the CA in its system trust store with Android's
 required filename, permissions, and SELinux context. A certificate-specific
@@ -271,8 +301,12 @@ LAB_SDK_ROOT            auto-detected Android SDK
 LAB_API_LEVEL           33
 LAB_ABI                 x86_64
 LAB_FRIDA_VERSION       auto
-LAB_BURP_HOST           Burp host reachable from the target
-LAB_BURP_PORT           Burp listener port
+LAB_PROXY_HOST          Proxy host reachable from the target [Burp by default]
+LAB_PROXY_PORT          Proxy listener port
+LAB_BURP_HOST           Older alias for LAB_PROXY_HOST, still works
+LAB_BURP_PORT           Older alias for LAB_PROXY_PORT, still works
+LAB_GPU_MODE            Emulator -gpu mode [auto]
+LAB_PORTABLE            1 = download Java/Python/7-Zip into tools/ only, never the host's own
 ```
 
 ### How values relate
@@ -292,10 +326,10 @@ LAB_SOURCE_AVD          -> source AVD started by init
 LAB_SOURCE_IMAGE_PACKAGE -> source system image installed when missing
 ```
 
-Burp is one shared endpoint:
+The proxy is one shared endpoint (Burp by default):
 
 ```text
-LAB_BURP_HOST + LAB_BURP_PORT -> Android global http_proxy on the target
+LAB_PROXY_HOST + LAB_PROXY_PORT -> Android global http_proxy on the target
 ```
 
 Example for another workstation:
@@ -392,6 +426,22 @@ if needed. Give it another 30-60s after `sys.boot_completed=1` before
 installing anything — package/activity manager services can still be
 settling right after that property flips.
 
+**Emulator window is black / boot times out on another machine (e.g. a VM)**
+
+Almost always a GPU-passthrough issue — VMware and similar VMs generally
+can't offer the real OpenGL passthrough `-gpu host` needs. The default is
+now `-gpu auto` (picks host GPU when it actually works, software rendering
+otherwise), and a boot timeout right after launching the emulator also
+triggers one automatic retry with `-gpu swiftshader_indirect`. If it still
+fails, force software rendering directly: `bun run init -- --gpu-mode=swiftshader_indirect`.
+
+**Need to verify or run the lab without touching the host's own installs**
+
+Use `--portable` (see **Running fully portable** above) — it downloads
+private copies of Java/Python/7-Zip into `tools/` instead of using `winget`
+or whatever the host already has, so nothing outside this project's own
+directory is touched.
+
 **"Can't find service: package/activity" during transfer or install**
 
 Transient system-server hiccup, most often seen right after an AVD's first
@@ -414,9 +464,9 @@ Check serials and override them with `LAB_TARGET_SERIAL` and
 `LAB_SOURCE_SERIAL`. All project ADB and Frida operations use the target serial
 explicitly.
 
-**Burp is unreachable**
+**Proxy (Burp or otherwise) is unreachable**
 
-Confirm Burp listens on the configured LAN address and port, then check:
+Confirm your proxy tool listens on the configured LAN address and port, then check:
 
 ```powershell
 adb -s $env:LAB_TARGET_SERIAL shell settings get global http_proxy

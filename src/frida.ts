@@ -1,9 +1,9 @@
 // ── Frida host install + device deploy ────────────────────────────────────────
-import { existsSync, readdirSync } from "fs";
+import { existsSync, readdirSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join, basename } from "path";
 import { log } from "./log.ts";
 import { run, runLive } from "./exec.ts";
-import { downloadFile, extractXz } from "./download.ts";
+import { downloadFile, extractXz, extractZip } from "./download.ts";
 import type { Adb } from "./adb.ts";
 import type { LabConfig } from "./config.ts";
 import type { PlatformInfo } from "./platform.ts";
@@ -96,21 +96,89 @@ function addToProcessPath(exePath: string): void {
   process.env.PATH = `${additions.join(sep)}${sep}${process.env.PATH ?? ""}`;
 }
 
+// ── Portable Python (embeddable package, no host install/winget) ──────────────
+
+const PORTABLE_PYTHON_VERSION = "3.12.7";
+
+function portablePythonExe(cfg: LabConfig): string {
+  return join(cfg.toolsDir, "python", "python.exe");
+}
+
+/**
+ * Download the official Python "embeddable package" zip into tools/python/
+ * and bootstrap pip into it — used only in --portable mode, so the host's
+ * own Python (if any) is never touched and winget is never invoked. Unlike
+ * a normal install, the embeddable package ships without pip and with
+ * `import site` disabled by default (needed for pip-installed packages
+ * under Lib/site-packages to be importable), so both are fixed up here.
+ */
+async function ensurePortablePython(cfg: LabConfig, platform: PlatformInfo): Promise<string> {
+  const exe = portablePythonExe(cfg);
+  if (existsSync(exe)) return exe;
+
+  if (platform.type !== "windows") {
+    throw new Error(
+      "--portable Python install is only implemented for Windows right now.\n" +
+      "Install Python normally on this platform (e.g. sudo apt install python3 python3-pip) and rerun without --portable.",
+    );
+  }
+
+  log.info("Portable mode: downloading a private Python into tools/python/ (the host's own Python, if any, is left untouched)…");
+  const dest = join(cfg.toolsDir, "python");
+  mkdirSync(dest, { recursive: true });
+  const url = `https://www.python.org/ftp/python/${PORTABLE_PYTHON_VERSION}/python-${PORTABLE_PYTHON_VERSION}-embed-amd64.zip`;
+  const zipFile = join(cfg.cacheDir, `python-${PORTABLE_PYTHON_VERSION}-embed-amd64.zip`);
+  await downloadFile(url, zipFile);
+  extractZip(zipFile, dest, platform, cfg); // embeddable zip is already flat, no wrapping folder
+  if (!existsSync(exe)) throw new Error(`Portable Python download did not produce ${exe}`);
+
+  for (const file of readdirSync(dest).filter(f => /^python\d+\._pth$/.test(f))) {
+    const pthPath = join(dest, file);
+    writeFileSync(pthPath, readFileSync(pthPath, "utf8").replace(/^#\s*import site/m, "import site"));
+  }
+
+  log.info("Bootstrapping pip into the portable interpreter…");
+  const getPip = join(cfg.cacheDir, "get-pip.py");
+  await downloadFile("https://bootstrap.pypa.io/get-pip.py", getPip);
+  const pipBootstrap = run(exe, [getPip, "--no-warn-script-location"]);
+  if (!pipBootstrap.ok) {
+    throw new Error(`Could not bootstrap pip for the portable Python:\n${pipBootstrap.stderr.trim() || pipBootstrap.stdout.trim()}`);
+  }
+
+  log.good(`Portable Python ready: ${exe}`);
+  return exe;
+}
+
+/**
+ * Point this process at an already-downloaded portable Python (tools/python/)
+ * without downloading or installing anything. Call this at the top of any
+ * standalone entry point (run.ts, verify.ts) that needs `frida`/`frida-ps`
+ * to resolve after a prior `--portable` bootstrap — each `bun <script>.ts`
+ * invocation is a fresh process, so the PATH addition ensureFridaHost() made
+ * during bootstrap doesn't carry over on its own. No-op if not in portable
+ * mode or if the portable Python hasn't been installed yet.
+ */
+export function activatePortablePython(cfg: LabConfig): void {
+  if (!cfg.portable) return;
+  const exe = portablePythonExe(cfg);
+  if (existsSync(exe)) addToProcessPath(exe);
+}
+
 /**
  * Ensure Frida host tools (frida, frida-ps, frida-trace …) are installed
  * via pip.  Installs/upgrades only if not already present.
  * Returns the installed version string.
  */
-export async function ensureFridaHost(cfg: LabConfig): Promise<string> {
+export async function ensureFridaHost(cfg: LabConfig, platform: PlatformInfo): Promise<string> {
   log.step("Frida host");
 
   let current = getHostFridaVersion();
-  if (current && cfg.fridaVersion === "auto") {
+  if (current && cfg.fridaVersion === "auto" && !cfg.portable) {
     log.good(`Frida host already installed: ${current}`);
     return current;
   }
 
-  if (current && cfg.fridaVersion !== "auto" && current === cfg.fridaVersion && !cfg.forceFrida) {
+  if (current && cfg.fridaVersion !== "auto" && current === cfg.fridaVersion && !cfg.forceFrida && !cfg.portable) {
     log.good(`Frida host already at requested version: ${current}`);
     return current;
   }
@@ -119,22 +187,31 @@ export async function ensureFridaHost(cfg: LabConfig): Promise<string> {
     ? "frida frida-tools"
     : `frida==${cfg.fridaVersion} frida-tools`;
 
-  // Find whatever Python is genuinely already on this machine before ever
-  // considering installing a new one — see findPythonExe() for why a bare
-  // PATH check alone isn't enough to tell "not installed" from "installed,
-  // but this process can't see it yet".
-  let pythonExe = findPythonExe();
-  if (pythonExe) {
+  let pythonExe: string | null;
+  if (cfg.portable) {
+    // Never fall back to whatever Python the host already has — download
+    // and use a private copy under tools/python/ only.
+    pythonExe = await ensurePortablePython(cfg, platform);
     addToProcessPath(pythonExe);
-    log.good(`Using existing Python: ${pythonExe}`);
-  } else if (process.platform === "win32" && run("winget", ["--version"]).ok) {
-    log.info("No usable Python found; installing one with winget…");
-    await runLive("winget", [
-      "install", "--id", "Python.Python.3.13", "--exact",
-      "--silent", "--accept-source-agreements", "--accept-package-agreements",
-    ]);
+    log.good(`Using portable Python: ${pythonExe}`);
+  } else {
+    // Find whatever Python is genuinely already on this machine before ever
+    // considering installing a new one — see findPythonExe() for why a bare
+    // PATH check alone isn't enough to tell "not installed" from "installed,
+    // but this process can't see it yet".
     pythonExe = findPythonExe();
-    if (pythonExe) addToProcessPath(pythonExe);
+    if (pythonExe) {
+      addToProcessPath(pythonExe);
+      log.good(`Using existing Python: ${pythonExe}`);
+    } else if (process.platform === "win32" && run("winget", ["--version"]).ok) {
+      log.info("No usable Python found; installing one with winget…");
+      await runLive("winget", [
+        "install", "--id", "Python.Python.3.13", "--exact",
+        "--silent", "--accept-source-agreements", "--accept-package-agreements",
+      ]);
+      pythonExe = findPythonExe();
+      if (pythonExe) addToProcessPath(pythonExe);
+    }
   }
 
   if (!pythonExe) {
@@ -144,6 +221,15 @@ export async function ensureFridaHost(cfg: LabConfig): Promise<string> {
       "  Linux:   sudo apt install python3 python3-pip\n" +
       "  macOS:   brew install python3",
     );
+  }
+
+  // Portable Python is a fresh interpreter every time tools/python/ doesn't
+  // already have it — Frida is never pre-installed on it, so the "already
+  // installed" shortcuts above don't apply; re-check here instead.
+  if (cfg.portable) {
+    current = getHostFridaVersion();
+    if (current && cfg.fridaVersion === "auto") return current;
+    if (current && cfg.fridaVersion !== "auto" && current === cfg.fridaVersion && !cfg.forceFrida) return current;
   }
 
   log.info(`Installing Frida host: ${pkg}`);
@@ -197,7 +283,7 @@ export async function getFridaServer(
 
   const url = `https://github.com/frida/frida/releases/download/${version}/${name}.xz`;
   await downloadFile(url, xzFile);
-  await extractXz(xzFile, cfg.fridaDir, platform);
+  await extractXz(xzFile, cfg.fridaDir, platform, cfg);
 
   if (!existsSync(binFile)) {
     throw new Error(`Expected extracted binary not found: ${binFile}`);

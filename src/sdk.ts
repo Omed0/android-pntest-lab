@@ -11,14 +11,31 @@
 //   https://developer.android.com/studio#command-line-tools-only
 //
 import { existsSync, mkdirSync, renameSync } from "fs";
-import { join, basename } from "path";
+import { join, basename, dirname } from "path";
 import { log } from "./log.ts";
 import { run, runWithStdin, runLive } from "./exec.ts";
-import { downloadFile, extractZip, ensure7z } from "./download.ts";
+import { downloadFile, extractZip, extractZipFlattenRoot, ensure7z } from "./download.ts";
 import type { LabConfig } from "./config.ts";
 import type { PlatformInfo } from "./platform.ts";
 
 // ── Java (required by sdkmanager.bat/avdmanager.bat, never checked before) ────
+
+function javaAlreadyWorks(): boolean {
+  return run("java", ["-version"]).exitCode === 0 || run("java", ["-version"]).stderr.includes("version");
+}
+
+/** Where --portable downloads a private JRE, independent of the host's own Java. */
+function portableJavaExe(cfg: LabConfig, platform: PlatformInfo): string {
+  return join(cfg.toolsDir, "java", "bin", `java${platform.exe}`);
+}
+
+/** Point this process (JAVA_HOME + PATH) at a specific java executable. */
+function usePortableJava(javaExe: string): void {
+  const binDir = dirname(javaExe);
+  process.env.JAVA_HOME = dirname(binDir);
+  const sep = process.platform === "win32" ? ";" : ":";
+  process.env.PATH = `${binDir}${sep}${process.env.PATH ?? ""}`;
+}
 
 /**
  * `sdkmanager`/`avdmanager` are themselves Java programs — their .bat/shell
@@ -28,15 +45,43 @@ import type { PlatformInfo } from "./platform.ts";
  * (no Java, no Android Studio) would fail at the very first cmdline-tools
  * invocation with a raw batch-script error instead of a clear, actionable
  * message — or, when `--install-sdk`/winget are available, installs one.
+ *
+ * In `--portable` mode, a JRE is instead downloaded as a plain zip into
+ * tools/java/ and used only from there — the host's own Java (if any) is
+ * never touched and winget is never invoked.
  */
-export async function ensureJava(cfg: LabConfig): Promise<void> {
-  if (run("java", ["-version"]).exitCode === 0 || run("java", ["-version"]).stderr.includes("version")) return;
+export async function ensureJava(cfg: LabConfig, platform: PlatformInfo): Promise<void> {
+  if (cfg.portable) {
+    const javaExe = portableJavaExe(cfg, platform);
+    if (existsSync(javaExe)) {
+      usePortableJava(javaExe);
+      return;
+    }
+    if (platform.type !== "windows") {
+      throw new Error(
+        "--portable Java install is only implemented for Windows right now.\n" +
+        "Install a JRE normally on this platform (e.g. sudo apt install default-jre) and rerun without --portable.",
+      );
+    }
+    log.info("Portable mode: downloading a private JRE into tools/java/ (the host's own Java, if any, is left untouched)…");
+    const url = "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jre/hotspot/normal/eclipse";
+    const zipFile = join(cfg.cacheDir, "temurin-21-jre-windows-x64.zip");
+    await downloadFile(url, zipFile);
+    extractZipFlattenRoot(zipFile, join(cfg.toolsDir, "java"), platform, cfg);
+    if (!existsSync(javaExe)) throw new Error(`Portable Java download did not produce ${javaExe}`);
+    usePortableJava(javaExe);
+    log.good(`Portable Java ready: ${javaExe}`);
+    return;
+  }
+
+  if (javaAlreadyWorks()) return;
 
   log.warn("Java runtime not found — required by sdkmanager/avdmanager.");
   if (!cfg.installSdk) {
     throw new Error(
       "Java (JRE/JDK) not found and is required to run the Android cmdline-tools.\n\n" +
-      "Install one and rerun, or rerun with --install-sdk to auto-install via winget:\n" +
+      "Install one and rerun, or rerun with --install-sdk to auto-install via winget\n" +
+      "(or --portable to download a private copy into this project instead):\n" +
       "  Windows: winget install EclipseAdoptium.Temurin.21.JRE\n" +
       "  Linux:   sudo apt install default-jre\n" +
       "  macOS:   brew install openjdk",
@@ -49,7 +94,7 @@ export async function ensureJava(cfg: LabConfig): Promise<void> {
       "install", "--id", "EclipseAdoptium.Temurin.21.JRE", "--exact",
       "--silent", "--accept-source-agreements", "--accept-package-agreements",
     ]);
-    if (code === 0 && (run("java", ["-version"]).exitCode === 0 || run("java", ["-version"]).stderr.includes("version"))) {
+    if (code === 0 && javaAlreadyWorks()) {
       log.good("Java installed.");
       return;
     }
@@ -108,9 +153,17 @@ export { sdkmanagerPath, avdmanagerPath };
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/** Returns the SDK root if a valid SDK is already present, otherwise null. */
+/**
+ * Returns the SDK root if a valid SDK is already present, otherwise null.
+ *
+ * In --portable mode, only `cfg.sdkRoot` (already forced to a private path
+ * under tools/ by loadConfig(), unless the user passed an explicit
+ * --sdk-root) is considered — the host's own ANDROID_HOME/ANDROID_SDK_ROOT/
+ * default-path SDK, if any, is deliberately never auto-detected here, so a
+ * portable run never silently borrows (or risks touching) it.
+ */
 export function findSdk(cfg: LabConfig, platform: PlatformInfo): string | null {
-  const candidates = [
+  const candidates = cfg.portable ? [cfg.sdkRoot] : [
     cfg.sdkRoot,
     process.env.ANDROID_HOME,
     process.env.ANDROID_SDK_ROOT,
@@ -140,7 +193,7 @@ export async function ensureSdk(
   platform: PlatformInfo,
 ): Promise<string> {
   log.step("Android SDK");
-  await ensureJava(cfg);
+  await ensureJava(cfg, platform);
   await ensure7z(cfg, platform);
 
   const existing = findSdk(cfg, platform);
@@ -194,7 +247,7 @@ async function installHeadlessSdk(
   //    SDK expects it at:        sdkRoot/cmdline-tools/latest/
   const tmpDir = join(sdkRoot, "_cmdtools_tmp");
   mkdirSync(tmpDir, { recursive: true });
-  extractZip(zipFile, tmpDir, platform);
+  extractZip(zipFile, tmpDir, platform, cfg);
 
   const latestDest = join(sdkRoot, "cmdline-tools", "latest");
   mkdirSync(join(sdkRoot, "cmdline-tools"), { recursive: true });

@@ -116,12 +116,18 @@ export const DEFAULTS = {
   /** Remote directory on the Android device to push frida-server to. */
   fridaRemoteDir: "/data/local/tmp",
 
-  // ── Burp Suite ────────────────────────────────────────────────────────────
+  // ── Proxy (Burp Suite by default, any other tool also works) ───────────────
   /**
-   * IP of the Burp listener as seen from inside the emulator.
+   * IP of the proxy listener as seen from inside the emulator.
    * 10.0.2.2 = the Windows host when using the standard Android emulator NAT.
    * Change to your machine's LAN IP when using a physical device or
    * a non-standard network setup.
+   *
+   * Burp Suite is the default and needs no extra flags. To use a different
+   * proxy tool, override --proxy-host/--proxy-port (same effect as the older
+   * --burp-host/--burp-port names, kept working as aliases) and either drop
+   * that tool's CA certificate under cert/ or pass --proxy-cert=<path>. To
+   * use no proxy at all, pass --no-proxy (alias: --no-burp).
    */
   burpHost:       "10.0.2.2",
   burpPort:       8080,
@@ -129,6 +135,30 @@ export const DEFAULTS = {
   // ── Runtime ───────────────────────────────────────────────────────────────
   /** How long (seconds) to wait for the emulator to finish booting. */
   emulatorBootTimeoutSec: 300,
+  /**
+   * Emulator `-gpu` mode. "auto" lets the emulator pick host-GPU passthrough
+   * when it actually works and fall back to software rendering (swiftshader)
+   * otherwise — this is the safe default for VMs (VMware, etc.), which
+   * usually can't offer real OpenGL passthrough. Forcing "host" previously
+   * caused an intermittent black emulator window on such machines (the GL
+   * context failed to initialize; a manual retry sometimes worked by luck).
+   * A single automatic retry with "swiftshader_indirect" also kicks in if
+   * the first boot attempt times out — see bootstrapLab()/initializeLab() in
+   * src/lab.ts.
+   */
+  gpuMode:        "auto",
+
+  // ── Portable mode ─────────────────────────────────────────────────────────
+  /**
+   * When true, Java/Python/7-Zip are downloaded as portable/zip
+   * distributions into this lab's own tools/ directory and used only from
+   * there — never a system-wide winget install, and never a silent fallback
+   * to a copy that happens to already be on the host's PATH. The Android
+   * SDK/AVD are already self-contained under --sdk-root/ANDROID_AVD_HOME
+   * regardless of this flag. Use this to verify (or run) the lab without
+   * touching anything outside its own directory tree.
+   */
+  portable:       false,
 } as const;
 
 // ── LabConfig interface ───────────────────────────────────────────────────────
@@ -160,6 +190,7 @@ export interface LabConfig {
   burpPort: number;
 
   emulatorBootTimeoutSec: number;
+  gpuMode: string;
 
   // Resolved paths (always absolute)
   toolsDir: string;
@@ -171,6 +202,7 @@ export interface LabConfig {
   forceFrida:   boolean;
   forceAvd:     boolean;
   skipEmulator: boolean;
+  portable:     boolean;
 }
 
 // ── loadConfig ────────────────────────────────────────────────────────────────
@@ -202,16 +234,34 @@ export function loadConfig(labRoot: string, argv = process.argv.slice(2)): LabCo
     if (e !== undefined) return e !== "0" && e !== "false";
     return def;
   }
+  /** Like str(), but tries several CLI/env key spellings in priority order (aliases). */
+  function strAlias(keys: string[], def: string): string {
+    for (const key of keys) if (key in args) return args[key] as string;
+    for (const key of keys) {
+      const e = process.env[`LAB_${toEnvKey(key)}`];
+      if (e !== undefined) return e;
+    }
+    return def;
+  }
+  function numAlias(keys: string[], def: number): number {
+    return Number(strAlias(keys, String(def)));
+  }
 
   const toolsDir = str("tools-dir", join(labRoot, "tools"));
   const cacheDir = str("cache-dir", join(toolsDir,  "cache"));
   const fridaDir = str("frida-dir", join(toolsDir,  "frida"));
+  const portable = bool("portable");
 
+  // In --portable mode, don't silently pick up a real Android SDK the host
+  // already has (via ANDROID_HOME/ANDROID_SDK_ROOT or the platform default
+  // path) — default to a private copy under this project's own tools/
+  // instead, same as every other portable-mode dependency. An explicit
+  // --sdk-root still wins either way.
   const sdkRoot =
     str("sdk-root", "") ||
-    process.env.ANDROID_HOME ||
-    process.env.ANDROID_SDK_ROOT ||
-    platform.sdkDefaultPath;
+    (portable
+      ? join(toolsDir, "android-sdk")
+      : process.env.ANDROID_HOME || process.env.ANDROID_SDK_ROOT || platform.sdkDefaultPath);
 
   return {
     targetSerial:   str("target-serial", DEFAULTS.targetSerial),
@@ -236,10 +286,11 @@ export function loadConfig(labRoot: string, argv = process.argv.slice(2)): LabCo
     fridaVersion:   str("frida-version",   DEFAULTS.fridaVersion),
     fridaRemoteDir: str("frida-remote-dir",DEFAULTS.fridaRemoteDir),
 
-    burpHost: str("burp-host", DEFAULTS.burpHost),
-    burpPort: num("burp-port", DEFAULTS.burpPort),
+    burpHost: strAlias(["proxy-host", "burp-host"], DEFAULTS.burpHost),
+    burpPort: numAlias(["proxy-port", "burp-port"], DEFAULTS.burpPort),
 
     emulatorBootTimeoutSec: num("boot-timeout", DEFAULTS.emulatorBootTimeoutSec),
+    gpuMode: str("gpu-mode", DEFAULTS.gpuMode),
 
     toolsDir,
     cacheDir,
@@ -249,6 +300,7 @@ export function loadConfig(labRoot: string, argv = process.argv.slice(2)): LabCo
     forceFrida:   bool("force-frida"),
     forceAvd:     bool("force-avd"),
     skipEmulator: bool("skip-emulator"),
+    portable,
   };
 }
 
@@ -320,21 +372,28 @@ Frida options
   --frida-remote-dir=<p>   Remote path       [${DEFAULTS.fridaRemoteDir}]
   --force-frida            Re-push frida-server even if already running
 
-Burp options
-  --burp-host=<ip>         Proxy host        [${DEFAULTS.burpHost}]  LAB_BURP_HOST
-  --burp-port=<n>          Proxy port        [${DEFAULTS.burpPort}]        LAB_BURP_PORT
+Proxy options (Burp Suite by default — any other proxy tool also works)
+  --proxy-host=<ip>        Proxy host        [${DEFAULTS.burpHost}]  LAB_PROXY_HOST
+  --proxy-port=<n>         Proxy port        [${DEFAULTS.burpPort}]        LAB_PROXY_PORT
+  --burp-host / --burp-port   Older names, still work as aliases for the above.
 
 Runtime flags
   --skip-emulator          Skip starting the emulator (already running)
   --force-avd              Recreate AVD even if it already exists
   --boot-timeout=<sec>     Boot wait timeout [${DEFAULTS.emulatorBootTimeoutSec}s]
+  --gpu-mode=<mode>        Emulator -gpu mode [${DEFAULTS.gpuMode}]  LAB_GPU_MODE
+                           Use "swiftshader_indirect" if boots black-screen in a VM.
+  --portable               Download Java/Python/7-Zip into tools/ only — never
+                           touches the host's own installs or uses winget.
 
 run.ts extra options
   --package=<pkg>          App package name  (required)
   --apk=<path>             APK to install before attaching
   --main-activity=<cls>    Activity to launch (optional)
   --frida-script=<path>    Frida JS script   [scripts/hook.js]
-  --no-burp                Skip Burp proxy setup
+  --proxy-tool=<burp|other> Whether to attempt Burp's auto CA download [burp]
+  --proxy-cert=<path>      Proxy CA certificate (default: first cert in ./cert)
+  --no-proxy               Skip proxy setup entirely (alias: --no-burp)
 `);
 }
 
@@ -346,5 +405,6 @@ export function printConfig(cfg: LabConfig): void {
   console.log("  RAM:    ", cfg.avdRamMb, "MB  cores:", cfg.avdCores);
   console.log("  SDK:    ", cfg.sdkRoot);
   console.log("  Frida:  ", cfg.fridaVersion === "auto" ? "auto (match host)" : cfg.fridaVersion);
-  console.log("  Burp:   ", `${cfg.burpHost}:${cfg.burpPort}`);
+  console.log("  Proxy:  ", `${cfg.burpHost}:${cfg.burpPort}`, "(Burp by default)");
+  console.log("  GPU:    ", cfg.gpuMode, cfg.portable ? " · portable mode" : "");
 }
