@@ -240,12 +240,26 @@ bun run run -- --package=com.example.app
 # Transfer an installed source package manually when needed
 bun run transfer -- --package=com.example.app
 
+# Find an APK's package name (needed by run/transfer/e2e) without installing it
+bun run apkinfo -- --apk=apk/target.apk
+bun run apkinfo -- --apk=apk/target.apk --quiet   # prints only the package name
+
 # Check target health
 bun run verify
 ```
 
 Use `bun run help`, `bun run init -- --help`, or `bun run transfer -- --help`
 for command-specific options.
+
+`apkinfo` reads the package name (plus version and launch activity) straight
+from the APK using the SDK's `aapt`/`aapt2` (build-tools) or `apkanalyzer`
+(cmdline-tools) — whichever is installed, no extra downloads. `--quiet` prints
+just the package name, so you can pipe it, e.g.:
+
+```powershell
+$pkg = bun run apkinfo -- --apk=apk/target.apk --quiet
+bun run transfer -- --package=$pkg
+```
 
 ## Proxy and certificates (Burp by default — any other tool also works)
 
@@ -360,6 +374,7 @@ android-pentest-lab/
   src/
     lab.ts                 Lifecycle commands and orchestration
     transfer.ts            Split APK transfer (source -> target)
+    apkinfo.ts             Read an APK's package name/version without installing
     adb.ts                 Serial-aware ADB wrapper, root-mode detection
     avd.ts                 AVD creation/startup, device-profile resolution
     config.ts              Defaults, flags, and LAB_* variables

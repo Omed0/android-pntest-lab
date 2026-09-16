@@ -9,6 +9,7 @@
     "bootstrap":  "bun src/lab.ts bootstrap",
     "run":        "bun run.ts",
     "transfer":   "bun src/transfer.ts",
+    "apkinfo":    "bun src/apkinfo.ts",
     "verify":     "bun verify.ts",
     "help":       "bun src/lab.ts help"
   },
