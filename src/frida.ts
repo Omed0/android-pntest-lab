@@ -1,5 +1,5 @@
 // ── Frida host install + device deploy ────────────────────────────────────────
-import { existsSync } from "fs";
+import { existsSync, readdirSync } from "fs";
 import { join, basename } from "path";
 import { log } from "./log.ts";
 import { run, runLive } from "./exec.ts";
@@ -31,6 +31,71 @@ export function getHostFridaVersion(): string | null {
   return null;
 }
 
+// ── Python discovery (Windows PATH is unreliable right after install) ─────────
+
+/**
+ * Locate a working Python interpreter without assuming PATH is current.
+ *
+ * A Python that's genuinely installed (via winget, the python.org installer,
+ * or the Microsoft Store) is frequently still invisible to `run("python",
+ * ...)`/`run("py", ...)` in an *already-running* shell/process — Windows
+ * only broadcasts the PATH change to new processes, and winget itself will
+ * happily report "already installed, no upgrade needed" while the current
+ * session still can't resolve it. Bare-name PATH lookups alone therefore
+ * cannot tell "not installed" apart from "installed, but this process can't
+ * see it yet" — which is exactly what produced a confusing "Could not
+ * install Frida via pip" error for an operator who already had Python.
+ *
+ * This checks bare names first (cheap, works when PATH is fine), then scans
+ * the same install locations winget/python.org/the Store actually use, the
+ * same pattern already used for 7-Zip in src/download.ts's try7z().
+ */
+function findPythonExe(): string | null {
+  for (const cmd of ["python", "python3", "py"]) {
+    if (run(cmd, ["--version"]).ok) return cmd;
+  }
+
+  const local = process.env.LOCALAPPDATA;
+  const candidates: string[] = [];
+  if (local) {
+    candidates.push(`${local}\\Microsoft\\WindowsApps\\python3.exe`);
+    candidates.push(`${local}\\Microsoft\\WindowsApps\\python.exe`);
+    // python.org / winget installs: LOCALAPPDATA\Programs\Python\Python3XX\python.exe
+    const programsDir = `${local}\\Programs\\Python`;
+    if (existsSync(programsDir)) {
+      try {
+        for (const entry of readdirSync(programsDir)) {
+          candidates.push(`${programsDir}\\${entry}\\python.exe`);
+        }
+      } catch { /* ignore */ }
+    }
+  }
+  if (process.env.ProgramFiles) {
+    candidates.push(`${process.env.ProgramFiles}\\Python3\\python.exe`);
+  }
+
+  return candidates.find(p => existsSync(p) && run(p, ["--version"]).ok) ?? null;
+}
+
+/**
+ * Prepend a Python interpreter's own directory and its Scripts/bin
+ * directory to this process's PATH so bare `pip`/`frida`/`frida-ps` calls
+ * (here and in run.ts/verify.ts/etc., which all assume PATH) work for the
+ * rest of this run — even when the OS-level PATH hasn't been refreshed for
+ * this already-running process (see findPythonExe() above).
+ */
+function addToProcessPath(exePath: string): void {
+  const dir = exePath.includes("\\") || exePath.includes("/")
+    ? exePath.slice(0, Math.max(exePath.lastIndexOf("\\"), exePath.lastIndexOf("/")))
+    : null;
+  if (!dir) return; // bare command name already on PATH — nothing to add
+  const sep = process.platform === "win32" ? ";" : ":";
+  const scriptsDir = process.platform === "win32" ? `${dir}\\Scripts` : `${dir}/../bin`;
+  const additions = [dir, scriptsDir].filter(p => existsSync(p));
+  if (additions.length === 0) return;
+  process.env.PATH = `${additions.join(sep)}${sep}${process.env.PATH ?? ""}`;
+}
+
 /**
  * Ensure Frida host tools (frida, frida-ps, frida-trace …) are installed
  * via pip.  Installs/upgrades only if not already present.
@@ -39,7 +104,7 @@ export function getHostFridaVersion(): string | null {
 export async function ensureFridaHost(cfg: LabConfig): Promise<string> {
   log.step("Frida host");
 
-  const current = getHostFridaVersion();
+  let current = getHostFridaVersion();
   if (current && cfg.fridaVersion === "auto") {
     log.good(`Frida host already installed: ${current}`);
     return current;
@@ -54,52 +119,45 @@ export async function ensureFridaHost(cfg: LabConfig): Promise<string> {
     ? "frida frida-tools"
     : `frida==${cfg.fridaVersion} frida-tools`;
 
-  log.info(`Installing Frida host: ${pkg}`);
-
-  // Try standard Python launchers first, then install Python on Windows.
-  const pipCommands: Array<[string, string[]]> = [
-    ["pip3", ["install", "--upgrade", ...pkg.split(" ")]],
-    ["pip", ["install", "--upgrade", ...pkg.split(" ")]],
-    ["python", ["-m", "pip", "install", "--upgrade", ...pkg.split(" ")]],
-    ["py", ["-m", "pip", "install", "--upgrade", ...pkg.split(" ")]],
-  ];
-
-  for (const [pip, args] of pipCommands) {
-    const r = run(pip, args);
-    if (r.ok) {
-      const v = getHostFridaVersion();
-      if (v) {
-        log.good(`Frida host installed: ${v}`);
-        return v;
-      }
-    }
-  }
-
-  if (process.platform === "win32" && run("winget", ["--version"]).ok) {
-    log.info("Python/pip not found; installing Python with winget…");
-    const installCode = await runLive("winget", [
+  // Find whatever Python is genuinely already on this machine before ever
+  // considering installing a new one — see findPythonExe() for why a bare
+  // PATH check alone isn't enough to tell "not installed" from "installed,
+  // but this process can't see it yet".
+  let pythonExe = findPythonExe();
+  if (pythonExe) {
+    addToProcessPath(pythonExe);
+    log.good(`Using existing Python: ${pythonExe}`);
+  } else if (process.platform === "win32" && run("winget", ["--version"]).ok) {
+    log.info("No usable Python found; installing one with winget…");
+    await runLive("winget", [
       "install", "--id", "Python.Python.3.13", "--exact",
       "--silent", "--accept-source-agreements", "--accept-package-agreements",
     ]);
-    if (installCode === 0) {
-      for (const [pip, args] of pipCommands.slice(2)) {
-        const r = run(pip, args);
-        if (r.ok) {
-          const v = getHostFridaVersion();
-          if (v) {
-            log.good(`Frida host installed: ${v}`);
-            return v;
-          }
-        }
-      }
-    }
+    pythonExe = findPythonExe();
+    if (pythonExe) addToProcessPath(pythonExe);
+  }
+
+  if (!pythonExe) {
+    throw new Error(
+      "Could not find or install Python.\n" +
+      "  Windows: winget install Python.Python.3.13\n" +
+      "  Linux:   sudo apt install python3 python3-pip\n" +
+      "  macOS:   brew install python3",
+    );
+  }
+
+  log.info(`Installing Frida host: ${pkg}`);
+  const install = run(pythonExe, ["-m", "pip", "install", "--upgrade", ...pkg.split(" ")]);
+  current = getHostFridaVersion();
+  if (install.ok && current) {
+    log.good(`Frida host installed: ${current}`);
+    return current;
   }
 
   throw new Error(
-    "Could not install Frida via pip.\n" +
-    "Make sure Python and pip are installed:\n" +
-    "  Windows: winget install Python.Python.3.13\n" +
-    "  Linux:   sudo apt install python3 python3-pip",
+    "Could not install Frida via pip, even with a working Python found at:\n" +
+    `  ${pythonExe}\n` +
+    (install.stderr.trim() || install.stdout.trim() || "(pip reported success but 'frida --version' still isn't runnable — check PATH.)"),
   );
 }
 

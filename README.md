@@ -50,7 +50,7 @@ Everything else below is either already automated or self-healing on
 | Dependency | Handled how |
 |---|---|
 | Java (JRE/JDK) | Detected before touching `sdkmanager`/`avdmanager` (both are Java programs); auto-installed via `winget install EclipseAdoptium.Temurin.21.JRE` on Windows with `--install-sdk`, otherwise a clear manual-install message. |
-| Python + pip | Same pattern, used to `pip install frida frida-tools`; falls back to `winget install Python.Python.3.13` on Windows if pip isn't found at all. |
+| Python + pip | Used to `pip install frida frida-tools`. An existing Python install is found and reused even when it isn't yet visible on PATH (common right after a fresh/winget install in an already-open shell — a bare `python`/`pip` PATH check alone can't tell "not installed" from "installed, but this process can't see it yet"); only installs a new one via `winget install Python.Python.3.13` on Windows when none can be found at all. |
 | 7-Zip (Windows only) | Auto-installed via `winget install 7zip.7zip` with `--install-sdk`; `.zip` extraction still falls back to the built-in `Expand-Archive` if 7-Zip can't be installed, but `.xz` (frida-server's format) has no fallback and needs it. |
 | Android cmdline-tools / Platform-Tools / Emulator / system images | Downloaded and installed by `sdkmanager` under `--install-sdk`, cached under `tools/cache/`. |
 | Root | Auto-detected per device — see **Root: two kinds, handled automatically** below. Never silently attempts an arbitrary rooting exploit. |
