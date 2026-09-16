@@ -4,7 +4,7 @@ import { detectPlatform } from "./platform.ts";
 import { ensureAvd, listAvds, startEmulator } from "./avd.ts";
 import { avdmanagerPath, emulatorPath, ensureSdk, sdkmanagerPath } from "./sdk.ts";
 import { findAdb } from "./adb.ts";
-import { loadConfig, printConfig } from "./config.ts";
+import { DEFAULTS, loadConfig, printConfig } from "./config.ts";
 import { fail, log } from "./log.ts";
 import {
   ensureFridaHost,
@@ -13,9 +13,9 @@ import {
   verifyFridaConnection,
 } from "./frida.ts";
 
-const DEFAULT_SOURCE_AVD = "Pixel_10_Pro";
-const DEFAULT_SOURCE_SERIAL = "emulator-5556";
-const DEFAULT_SOURCE_IMAGE = "system-images;android-36.1;google_apis_playstore_ps16k;x86_64";
+const DEFAULT_SOURCE_AVD = DEFAULTS.sourceAvdName;
+const DEFAULT_SOURCE_SERIAL = DEFAULTS.sourceSerial;
+const DEFAULT_SOURCE_IMAGE = DEFAULTS.sourceImagePackage;
 const DEFAULT_TIMEOUT_SEC = 300;
 
 export interface InitializeOptions {
@@ -60,9 +60,9 @@ Usage
   bun run init -- --skip-source
 
 Options
-  --source-avd=<name>       Play Store AVD [${DEFAULT_SOURCE_AVD}]
-  --source-serial=<id>      Play Store serial [${DEFAULT_SOURCE_SERIAL}]
-  --source-image-package=<p> Android 36 Play Store image [${DEFAULT_SOURCE_IMAGE}]
+  --source-avd=<name>       Play Store AVD [LAB_SOURCE_AVD]
+  --source-serial=<id>      Play Store serial [LAB_SOURCE_SERIAL]
+  --source-image-package=<p> Play Store image [LAB_SOURCE_IMAGE_PACKAGE]
   --skip-source             Prepare only the rooted target
   --timeout=<sec>           Source boot timeout [${DEFAULT_TIMEOUT_SEC}]
 `);

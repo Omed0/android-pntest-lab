@@ -30,12 +30,11 @@ The other runtime entry points are intentionally focused:
 
 | Role | Default AVD | Default serial | Purpose |
 |---|---|---|---|
-| Target | `Pixel_7_Pro` | `emulator-5554` | Rooted Android 13/API 33, Frida target |
-| Source | `Pixel_10_Pro` | `emulator-5556` | Android 36 Play Store app source |
+| Target | `$LAB_TARGET_AVD` | `$LAB_TARGET_SERIAL` | Rooted lower-API Frida target |
+| Source | `$LAB_SOURCE_AVD` | `$LAB_SOURCE_SERIAL` | Play Store app source |
 
-The target defaults to `google_apis`, `x86_64`, and API 33 because it is a
-practical rooted Frida image. The source defaults to the Android 36.1
-`google_apis_playstore_ps16k/x86_64` image.
+The target image, source image, AVD names, and serials are configuration values;
+set them for each machine rather than relying on these examples.
 
 ## Requirements
 
@@ -61,17 +60,17 @@ Set-Location .\android-pntest-lab
 bun install
 ```
 
-Configure the two emulator roles and Burp for this lab:
+Configure the two emulator roles and Burp for the current machine:
 
 ```powershell
-$env:LAB_TARGET_SERIAL = "emulator-5554"
-$env:LAB_SOURCE_SERIAL = "emulator-5556"
-$env:LAB_SOURCE_AVD = "Pixel_10_Pro"
-$env:LAB_BURP_HOST = "192.168.10.91"
-$env:LAB_BURP_PORT = "6666"
+$env:LAB_TARGET_SERIAL = "<rooted-target-serial>"
+$env:LAB_SOURCE_SERIAL = "<play-source-serial>"
+$env:LAB_SOURCE_AVD = "<play-source-avd-name>"
+$env:LAB_BURP_HOST = "<burp-reachable-host>"
+$env:LAB_BURP_PORT = "<burp-listener-port>"
 ```
 
-Start Burp with a listener on `192.168.10.91:6666`, then initialize both roles:
+Start Burp on the configured host and port, then initialize both roles:
 
 ```powershell
 bun run init -- --install-sdk
@@ -86,7 +85,7 @@ Verify root directly when preparing a new target:
 
 ```powershell
 $adb = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
-& $adb -s emulator-5554 shell su -c id
+& $adb -s $env:LAB_TARGET_SERIAL shell su -c id
 ```
 
 Continue only when the output contains `uid=0(root)`.
@@ -97,19 +96,19 @@ Use this as the normal workflow:
 
 ```powershell
 bun run e2e -- `
-  --package=com.tarikalthuraya.maui.android `
-  --burp-host=192.168.10.91 `
-  --burp-port=6666
+  --package=<authorized.package.name> `
+  --burp-host=$env:LAB_BURP_HOST `
+  --burp-port=$env:LAB_BURP_PORT
 ```
 
 With a local APK as the first installation source:
 
 ```powershell
 bun run e2e -- `
-  --package=com.tarikalthuraya.maui.android `
-  --apk=.\apk\Tarik.apk `
-  --burp-host=192.168.10.91 `
-  --burp-port=6666
+  --package=<authorized.package.name> `
+  --apk=.\apk\<target.apk> `
+  --burp-host=$env:LAB_BURP_HOST `
+  --burp-port=$env:LAB_BURP_PORT
 ```
 
 The flow is:
@@ -158,7 +157,7 @@ The runner sets the target's global Android proxy to the configured
 `LAB_BURP_HOST:LAB_BURP_PORT`. For this lab that is:
 
 ```text
-192.168.10.91:6666
+$env:LAB_BURP_HOST`:$env:LAB_BURP_PORT
 ```
 
 If `cert/` has no certificate, the runner requests Burp's CA through
@@ -176,22 +175,62 @@ HTTPS interception.
 
 Priority is:
 
-1. CLI flag, for example `--burp-port=6666`.
-2. Environment variable, for example `LAB_BURP_PORT=6666`.
+1. CLI flag, for example `--burp-port=<port>`.
+2. Environment variable, for example `LAB_BURP_PORT=<port>`.
 3. Built-in default.
 
 Important variables:
 
 ```text
-LAB_TARGET_SERIAL       emulator-5554
-LAB_SOURCE_SERIAL       emulator-5556
-LAB_SOURCE_AVD          Pixel_10_Pro
+LAB_TARGET_SERIAL       rooted target ADB serial
+LAB_SOURCE_SERIAL       Play Store source ADB serial
+LAB_SOURCE_AVD          Play Store source AVD name
+LAB_SOURCE_IMAGE_PACKAGE Play Store source image package
 LAB_SDK_ROOT            auto-detected Android SDK
 LAB_API_LEVEL           33
 LAB_ABI                 x86_64
 LAB_FRIDA_VERSION       auto
-LAB_BURP_HOST           10.0.2.2
-LAB_BURP_PORT           8080
+LAB_BURP_HOST           Burp host reachable from the target
+LAB_BURP_PORT           Burp listener port
+```
+
+### How values relate
+
+The target values control the rooted test device:
+
+```text
+LAB_TARGET_SERIAL -> ADB commands, root checks, Frida, proxy, and app launch
+LAB_AVD_NAME      -> target AVD created/started by bootstrap
+```
+
+The source values control only Play Store recovery:
+
+```text
+LAB_SOURCE_SERIAL       -> source ADB device
+LAB_SOURCE_AVD          -> source AVD started by init
+LAB_SOURCE_IMAGE_PACKAGE -> source system image installed when missing
+```
+
+Burp is one shared endpoint:
+
+```text
+LAB_BURP_HOST + LAB_BURP_PORT -> Android global http_proxy on the target
+```
+
+Example for another workstation:
+
+```powershell
+$env:LAB_TARGET_SERIAL = "emulator-6000"
+$env:LAB_SOURCE_SERIAL = "emulator-6002"
+$env:LAB_AVD_NAME = "Rooted_Target"
+$env:LAB_SOURCE_AVD = "Play_Source"
+$env:LAB_BURP_HOST = "192.168.50.20"
+$env:LAB_BURP_PORT = "8080"
+
+bun run e2e -- `
+  --package=com.example.authorized `
+  --burp-host=$env:LAB_BURP_HOST `
+  --burp-port=$env:LAB_BURP_PORT
 ```
 
 ## Project layout
@@ -245,7 +284,7 @@ explicitly.
 Confirm Burp listens on the configured LAN address and port, then check:
 
 ```powershell
-adb -s emulator-5554 shell settings get global http_proxy
+adb -s $env:LAB_TARGET_SERIAL shell settings get global http_proxy
 bun run verify
 ```
 

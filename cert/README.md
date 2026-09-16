@@ -2,11 +2,16 @@
 
 The normal runner manages this folder automatically.
 
-1. Start Burp on the configured listener, for example `192.168.10.91:6666`.
+1. Start Burp on the host and port configured by `LAB_BURP_HOST` and
+   `LAB_BURP_PORT`.
 2. Run `bun run e2e -- --package=<package>`.
 3. The runner downloads Burp's CA from `http://burp/cert` when no local CA exists.
 4. It saves the CA as `cert/burp-ca.cer`, installs it into the rooted target's
    system trust store, and verifies the certificate marker.
+
+If the CA cannot be downloaded or is not present, `run.ts` pauses and asks you
+to place the certificate in this folder, then type `y` to retry. It will not
+continue with an unverified certificate setup.
 
 You can provide a certificate manually as `burp-ca.cer`, `burp-ca.crt`,
 `burp-ca.der`, or `burp-ca.pem`, or pass `--burp-cert=<path>`.

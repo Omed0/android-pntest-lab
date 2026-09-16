@@ -4,7 +4,7 @@
 import { existsSync, mkdirSync } from "fs";
 import { basename, join } from "path";
 import { detectPlatform } from "./platform.ts";
-import { loadConfig } from "./config.ts";
+import { DEFAULTS, loadConfig } from "./config.ts";
 import { findAdb } from "./adb.ts";
 import { log, fail } from "./log.ts";
 import { run } from "./exec.ts";
@@ -20,8 +20,8 @@ interface TransferOptions {
 
 function parseArgs(argv: string[]): TransferOptions {
   const options: TransferOptions = {
-    sourceSerial: process.env.LAB_SOURCE_SERIAL ?? "emulator-5556",
-    targetSerial: process.env.LAB_TARGET_SERIAL ?? "emulator-5554",
+    sourceSerial: process.env.LAB_SOURCE_SERIAL ?? DEFAULTS.sourceSerial,
+    targetSerial: process.env.LAB_TARGET_SERIAL ?? DEFAULTS.targetSerial,
     waitTimeoutSec: Number(process.env.LAB_TRANSFER_TIMEOUT ?? 600),
     keepCache: false,
     noOpen: false,
@@ -54,8 +54,8 @@ Usage
 
 Options
   --package=<pkg>          Package to transfer (required)
-  --source-serial=<id>     Play Store source [LAB_SOURCE_SERIAL or emulator-5556]
-  --target-serial=<id>     Rooted target [LAB_TARGET_SERIAL or emulator-5554]
+  --source-serial=<id>     Play Store source [LAB_SOURCE_SERIAL]
+  --target-serial=<id>     Rooted target [LAB_TARGET_SERIAL]
   --wait-timeout=<sec>     Source install timeout [600]
   --keep-cache             Keep APK cache in tools/cache/transfers
   --no-open                Do not open the Play Store page

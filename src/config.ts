@@ -5,6 +5,20 @@
 //   2. Env var:    LAB_AVD_NAME=MyDevice LAB_AVD_RAM=8192 bun run bootstrap
 //   3. Default:    the values below
 //
+// Role relationships:
+//   LAB_TARGET_SERIAL -> rooted device used by bootstrap, run, verify, and Frida
+//   LAB_SOURCE_SERIAL -> optional Play Store device used only for APK recovery
+//   LAB_SOURCE_AVD -> AVD name started for LAB_SOURCE_SERIAL
+//   LAB_BURP_HOST/PORT -> one proxy endpoint written to the target device
+//
+// PowerShell example for a different machine:
+//   $env:LAB_TARGET_SERIAL = "emulator-6000"
+//   $env:LAB_SOURCE_SERIAL = "emulator-6002"
+//   $env:LAB_SOURCE_AVD = "Play_Source"
+//   $env:LAB_BURP_HOST = "192.168.50.20"
+//   $env:LAB_BURP_PORT = "8080"
+//   bun run e2e -- --package=com.example.authorized --burp-host=$env:LAB_BURP_HOST --burp-port=$env:LAB_BURP_PORT
+//
 // Examples
 // ────────
 //   # Minimal — use every default:
@@ -31,8 +45,16 @@ import { join } from "path";
 import { detectPlatform } from "./platform.ts";
 
 export const DEFAULTS = {
-  /** ADB serial for the rooted lab emulator. */
+  /** Fallback ADB serial; override with LAB_TARGET_SERIAL on each machine. */
   targetSerial:   "emulator-5554",
+  /** Fallback source serial; override with LAB_SOURCE_SERIAL. */
+  sourceSerial:   "emulator-5556",
+  /** Fallback target AVD; override with LAB_AVD_NAME. */
+  targetAvdName:  "Pixel_7_Pro",
+  /** Fallback source AVD; override with LAB_SOURCE_AVD. */
+  sourceAvdName:  "Pixel_10_Pro",
+  /** Fallback source image; override with LAB_SOURCE_IMAGE_PACKAGE. */
+  sourceImagePackage: "system-images;android-36.1;google_apis_playstore_ps16k;x86_64",
 
   // ── AVD ──────────────────────────────────────────────────────────────────
   /** Android Virtual Device name shown in Android Studio / avdmanager. */
@@ -101,6 +123,9 @@ export const DEFAULTS = {
 
 export interface LabConfig {
   targetSerial:   string;
+  sourceSerial:   string;
+  sourceAvdName:   string;
+  sourceImagePackage: string;
 
   avdName:        string;
   apiLevel:       number;
@@ -177,6 +202,9 @@ export function loadConfig(labRoot: string, argv = process.argv.slice(2)): LabCo
 
   return {
     targetSerial:   str("target-serial", DEFAULTS.targetSerial),
+    sourceSerial:   str("source-serial", DEFAULTS.sourceSerial),
+    sourceAvdName:  str("source-avd", DEFAULTS.sourceAvdName),
+    sourceImagePackage: str("source-image-package", DEFAULTS.sourceImagePackage),
 
     avdName:        str("avd-name",         DEFAULTS.avdName),
     apiLevel:       num("api-level",         DEFAULTS.apiLevel),
@@ -254,7 +282,10 @@ Usage
   bun verify.ts                  # quick connectivity check
 
 AVD options (default → env var → flag)
-  --target-serial=<id>      Rooted lab ADB serial [${DEFAULTS.targetSerial}]  LAB_TARGET_SERIAL
+  --target-serial=<id>      Rooted lab ADB serial [LAB_TARGET_SERIAL]
+  --source-serial=<id>      Play Store source serial [LAB_SOURCE_SERIAL]
+  --source-avd=<name>       Play Store source AVD [LAB_SOURCE_AVD]
+  --source-image-package=<p> Source image package [LAB_SOURCE_IMAGE_PACKAGE]
   --avd-name=<name>        AVD name          [${DEFAULTS.avdName}]  LAB_AVD_NAME
   --api-level=<n>          Android API level [${DEFAULTS.apiLevel}]      LAB_API_LEVEL
   --abi=<abi>              CPU ABI           [${DEFAULTS.abi}]   LAB_ABI

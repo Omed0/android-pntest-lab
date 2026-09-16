@@ -20,11 +20,11 @@
 //
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { existsSync, mkdirSync, readdirSync, statSync } from "fs";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, statSync } from "fs";
 import { join } from "path";
 import { log, fail } from "./src/log.ts";
 import { detectPlatform } from "./src/platform.ts";
-import { loadConfig, printConfig } from "./src/config.ts";
+import { DEFAULTS, loadConfig, printConfig } from "./src/config.ts";
 import { findAdb } from "./src/adb.ts";
 import {
   getHostFridaVersion,
@@ -53,7 +53,7 @@ function parseRunArgs(argv: string[]): RunOptions {
     burp:       true,
     spawnMode:  false,
     verbose:    false,
-    sourceSerial: process.env.LAB_SOURCE_SERIAL ?? "emulator-5556",
+    sourceSerial: process.env.LAB_SOURCE_SERIAL ?? DEFAULTS.sourceSerial,
   };
 
   for (const arg of argv.slice(2)) {
@@ -185,7 +185,9 @@ function findBurpCertificate(labRoot: string, requested?: string): string | null
   if (requested) return existsSync(requested) ? requested : null;
   const certDir = join(labRoot, "cert");
   if (!existsSync(certDir)) return null;
-  const name = readdirSync(certDir).find(file => /\.(cer|crt|der|pem)$/i.test(file));
+  const name = readdirSync(certDir).find(file =>
+    !file.startsWith(".") && /\.(cer|crt|der|pem)$/i.test(file)
+  );
   return name ? join(certDir, name) : null;
 }
 
@@ -224,8 +226,7 @@ function prepareAndroidCertificate(labRoot: string, certPath: string): { hash: s
     if (!hash) continue;
 
     if (format === "DER") {
-      const copy = run("powershell", ["-NoProfile", "-Command", `Copy-Item -LiteralPath '${certPath}' -Destination '${derPath}' -Force`]);
-      if (!copy.ok) throw new Error(`Could not prepare Burp CA: ${copy.stderr.trim()}`);
+      if (certPath !== derPath) copyFileSync(certPath, derPath);
     } else {
       const convert = run("openssl", ["x509", "-in", certPath, "-outform", "DER", "-out", derPath]);
       if (!convert.ok) throw new Error(`Could not convert Burp CA to DER: ${convert.stderr.trim()}`);
@@ -243,10 +244,21 @@ async function ensureBurpCertificate(
   burpPort: number,
   requestedPath?: string,
 ): Promise<void> {
-  const certPath = findBurpCertificate(labRoot, requestedPath) ??
+  let certPath = findBurpCertificate(labRoot, requestedPath) ??
     downloadBurpCertificate(labRoot, burpHost, burpPort);
   if (!certPath) {
-    throw new Error("Burp CA download failed. Keep Burp listening and retry, or place a certificate in ./cert.");
+    log.warn("Burp CA was not found or could not be downloaded.");
+    log.info("Export Burp's CA from http://burp/cert and save it as cert/burp-ca.cer.");
+    log.info("Alternatively pass --burp-cert=<path> to use a certificate elsewhere.");
+    const answer = prompt("After placing the certificate, type y to retry: ");
+    if (answer?.trim().toLowerCase() !== "y") {
+      throw new Error("Burp CA setup cancelled. No certificate was provided.");
+    }
+    certPath = findBurpCertificate(labRoot, requestedPath) ??
+      downloadBurpCertificate(labRoot, burpHost, burpPort);
+    if (!certPath) {
+      throw new Error("Burp CA is still missing. Save it under cert/ and rerun.");
+    }
   }
 
   const { hash, derPath } = prepareAndroidCertificate(labRoot, certPath);
@@ -312,6 +324,21 @@ function getFridaServerPid(adb: ReturnType<typeof findAdb>, version: string): st
   return pid || null;
 }
 
+function getAppPid(adb: ReturnType<typeof findAdb>, pkg: string): string | null {
+  const pid = adb.shell(`pidof ${pkg} 2>/dev/null || true`).trim().split(/\s+/)[0];
+  return /^\d+$/.test(pid) ? pid : null;
+}
+
+function waitForAppPid(adb: ReturnType<typeof findAdb>, pkg: string, timeoutMs = 10_000): string | null {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const pid = getAppPid(adb, pkg);
+    if (pid) return pid;
+    Bun.sleepSync(500);
+  }
+  return null;
+}
+
 // ── Frida attach ──────────────────────────────────────────────────────────────
 
 /**
@@ -321,6 +348,7 @@ function getFridaServerPid(adb: ReturnType<typeof findAdb>, version: string): st
  */
 async function attachFrida(
   pkg: string,
+  adb: ReturnType<typeof findAdb>,
   serial: string,
   fridaScript: string | undefined,
   spawnMode: boolean,
@@ -331,11 +359,17 @@ async function attachFrida(
   const args: string[] = ["-D", serial];
 
   if (spawnMode) {
-    args.push("--spawn", pkg);
+    args.push("-f", pkg);
     log.info(`Spawning ${pkg} under Frida…`);
   } else {
-    args.push("-n", pkg);
-    log.info(`Attaching to ${pkg}…`);
+    const pid = waitForAppPid(adb, pkg);
+    if (pid) {
+      args.push("-p", pid);
+      log.info(`Attaching to ${pkg} (PID=${pid})…`);
+    } else {
+      args.push("-n", pkg);
+      log.info(`Attaching to ${pkg} by name…`);
+    }
   }
 
   if (fridaScript) {
@@ -476,7 +510,9 @@ async function main(): Promise<void> {
   }
 
   // ── 6. Launch app ──────────────────────────────────────────────────────────
-  launchApp(adb, runOpts.package, runOpts.mainActivity);
+  if (!runOpts.spawnMode) {
+    launchApp(adb, runOpts.package, runOpts.mainActivity);
+  }
 
   // ── 7. Locate Frida script ─────────────────────────────────────────────────
   let fridaScript = runOpts.fridaScript;
@@ -489,7 +525,7 @@ async function main(): Promise<void> {
   }
 
   // ── 8. Attach Frida ────────────────────────────────────────────────────────
-  await attachFrida(runOpts.package, cfg.targetSerial, fridaScript, runOpts.spawnMode, runOpts.verbose);
+  await attachFrida(runOpts.package, adb, cfg.targetSerial, fridaScript, runOpts.spawnMode, runOpts.verbose);
 }
 
 main().catch(err => {
