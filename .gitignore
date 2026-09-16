@@ -1,0 +1,18 @@
+node_modules/
+bun.lock
+
+# Downloaded frida binaries (large)
+tools/frida/
+tools/cache/
+
+# Android SDK if installed locally inside the lab
+tools/android-sdk/
+
+# APKs under test
+*.apk
+
+# Local Burp certificates
+cert/*.cer
+cert/*.crt
+cert/*.der
+cert/*.pem

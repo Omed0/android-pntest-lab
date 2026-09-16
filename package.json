@@ -1,0 +1,19 @@
+{
+  "name": "android-pentest-lab",
+  "version": "1.0.0",
+  "description": "Cross-platform Android mobile-pentesting lab — Bun/TypeScript (Windows · WSL · Linux)",
+  "type": "module",
+  "scripts": {
+    "e2e":        "bun scripts/run-e2e.ts",
+    "init":       "bun scripts/initialize-lab.ts",
+    "bootstrap":  "bun scripts/bootstrap-lab.ts",
+    "run":        "bun run.ts",
+    "transfer":   "bun src/transfer.ts",
+    "verify":     "bun verify.ts",
+    "help":       "bun scripts/bootstrap-lab.ts --help"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "bun-types": "latest"
+  }
+}

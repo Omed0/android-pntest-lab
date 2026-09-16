@@ -1,0 +1,6 @@
+[install]
+dev = true
+
+[run]
+# bun is used as the shell so TypeScript files run without a separate step
+shell = "bun"
