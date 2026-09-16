@@ -2,7 +2,7 @@
 import { existsSync } from "fs";
 import { join, basename } from "path";
 import { log } from "./log.ts";
-import { run, runLive, runOrFail } from "./exec.ts";
+import { run, runLive } from "./exec.ts";
 import { downloadFile, extractXz } from "./download.ts";
 import type { Adb } from "./adb.ts";
 import type { LabConfig } from "./config.ts";

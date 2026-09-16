@@ -26,14 +26,13 @@ import { log, fail } from "./src/log.ts";
 import { detectPlatform } from "./src/platform.ts";
 import { loadConfig, printConfig } from "./src/config.ts";
 import { findAdb } from "./src/adb.ts";
-import { emulatorPath } from "./src/sdk.ts";
 import {
   getHostFridaVersion,
   getFridaServer,
   deployFridaServer,
   verifyFridaConnection,
 } from "./src/frida.ts";
-import { run, runLive, runOrFail } from "./src/exec.ts";
+import { run, runLive } from "./src/exec.ts";
 
 // ── Run-specific CLI options ──────────────────────────────────────────────────
 
@@ -144,10 +143,6 @@ function setBurpProxy(adb: ReturnType<typeof findAdb>, host: string, port: numbe
   log.info(`  Burp > Proxy > Proxy Listeners > Binding address = All interfaces, port ${port}`);
 }
 
-function clearBurpProxy(adb: ReturnType<typeof findAdb>): void {
-  adb.shell("settings put global http_proxy :0");
-}
-
 // ── APK install ───────────────────────────────────────────────────────────────
 
 function installApk(adb: ReturnType<typeof findAdb>, apkPath: string): void {
@@ -221,8 +216,23 @@ function downloadBurpCertificate(labRoot: string, host: string, port: number): s
   return null;
 }
 
-function confirm(promptText: string): boolean {
-  return (prompt(promptText) ?? "").trim().toLowerCase() === "y";
+function prepareAndroidCertificate(labRoot: string, certPath: string): { hash: string; derPath: string } {
+  const derPath = join(labRoot, "cert", ".burp-ca.der");
+  for (const format of ["DER", "PEM"]) {
+    const hashResult = run("openssl", ["x509", "-subject_hash_old", "-inform", format, "-in", certPath]);
+    const hash = hashResult.stdout.split(/\r?\n/).map(line => line.trim()).find(line => /^[0-9a-f]{8}$/i.test(line));
+    if (!hash) continue;
+
+    if (format === "DER") {
+      const copy = run("powershell", ["-NoProfile", "-Command", `Copy-Item -LiteralPath '${certPath}' -Destination '${derPath}' -Force`]);
+      if (!copy.ok) throw new Error(`Could not prepare Burp CA: ${copy.stderr.trim()}`);
+    } else {
+      const convert = run("openssl", ["x509", "-in", certPath, "-outform", "DER", "-out", derPath]);
+      if (!convert.ok) throw new Error(`Could not convert Burp CA to DER: ${convert.stderr.trim()}`);
+    }
+    return { hash: hash.toLowerCase(), derPath };
+  }
+  throw new Error(`Burp CA is not a readable X.509 certificate: ${certPath}`);
 }
 
 async function ensureBurpCertificate(
@@ -233,34 +243,33 @@ async function ensureBurpCertificate(
   burpPort: number,
   requestedPath?: string,
 ): Promise<void> {
-  const marker = "/data/local/tmp/.android-pentest-lab-burp-cert-ready";
-  if (adb.rootShell(`test -f ${marker} && echo YES || true`) === "YES") {
-    log.good("Burp certificate setup already confirmed on the target.");
-    return;
-  }
-
   const certPath = findBurpCertificate(labRoot, requestedPath) ??
     downloadBurpCertificate(labRoot, burpHost, burpPort);
   if (!certPath) {
-    log.warn("No Burp CA certificate found in ./cert.");
-    log.info("Export Burp's CA certificate, save it as cert/burp-ca.cer, and install it on the emulator.");
-    log.info("On Android: open the certificate file, choose CA certificate, and complete the prompts.");
-    if (!confirm("After installing the Burp CA on the target, type y to continue: ")) {
-      throw new Error("Burp certificate setup was not confirmed.");
-    }
-    adb.rootShell(`touch ${marker}`);
+    throw new Error("Burp CA download failed. Keep Burp listening and retry, or place a certificate in ./cert.");
+  }
+
+  const { hash, derPath } = prepareAndroidCertificate(labRoot, certPath);
+  const marker = `/data/local/tmp/.android-pentest-lab-burp-cert-${hash}`;
+  const destination = `/system/etc/security/cacerts/${hash}.0`;
+  if (adb.rootShell(`test -f ${marker} && test -f ${destination} && echo YES || true`) === "YES") {
+    log.good(`Burp system CA already installed: ${destination}`);
     return;
   }
 
-  const remote = "/sdcard/Download/android-pentest-lab-burp-ca.cer";
+  const remote = "/data/local/tmp/android-pentest-lab-burp-ca.der";
   log.info(`Using Burp CA: ${certPath}`);
-  adb.push(certPath, remote, platform);
-  adb.shell(`am start -a android.intent.action.VIEW -t application/x-x509-ca-cert -d file://${remote}`);
-  log.info("Android certificate installation has been opened.");
-  if (!confirm("Complete the Android CA installation, then type y to continue: ")) {
-    throw new Error("Burp certificate installation was not confirmed.");
+  adb.push(derPath, remote, platform);
+  log.info(`Installing rooted system CA: ${destination}`);
+  const remount = adb.rootShell("mount -o rw,remount /system 2>/dev/null || mount -o rw,remount / 2>/dev/null || true");
+  adb.rootShell(`mkdir -p /system/etc/security/cacerts && cp ${remote} ${destination} && chmod 644 ${destination} && chown 0:0 ${destination} && chcon u:object_r:system_file:s0 ${destination} 2>/dev/null || true`);
+  adb.rootShell(`rm -f ${remote}`);
+  const installed = adb.rootShell(`test -f ${destination} && stat -c '%a' ${destination} 2>/dev/null | grep -q 644 && echo YES || true`);
+  if (installed !== "YES") {
+    throw new Error(`Burp CA was not installed in the rooted system trust store. Remount output: ${remount}`);
   }
   adb.rootShell(`touch ${marker}`);
+  log.good(`Burp system CA installed and verified: ${destination}`);
 }
 
 // ── App launch ────────────────────────────────────────────────────────────────

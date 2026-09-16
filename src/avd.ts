@@ -3,8 +3,8 @@ import { existsSync, writeFileSync, mkdirSync, readFileSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 import { log } from "./log.ts";
-import { run, runOrFail, runLive } from "./exec.ts";
-import { avdmanagerPath, emulatorPath } from "./sdk.ts";
+import { run, runLive } from "./exec.ts";
+import { avdmanagerPath, emulatorPath, sdkmanagerPath, systemImageInstalled } from "./sdk.ts";
 import type { LabConfig } from "./config.ts";
 import type { PlatformInfo } from "./platform.ts";
 
@@ -33,10 +33,10 @@ export function avdExists(name: string, emuPath: string): boolean {
  * After creation, writes a hardware config with the RAM / core / disk values
  * from the config so the emulator uses them by default.
  */
-export function ensureAvd(
+export async function ensureAvd(
   cfg: LabConfig,
   platform: PlatformInfo,
-): void {
+): Promise<void> {
   log.step("AVD");
 
   const emuPath = emulatorPath(cfg.sdkRoot, platform);
@@ -45,6 +45,24 @@ export function ensureAvd(
       `emulator not found: ${emuPath}\n` +
       "Run bootstrap with --install-sdk to install the Android Emulator.",
     );
+  }
+
+  if (!systemImageInstalled(cfg)) {
+    if (!cfg.installSdk) {
+      throw new Error(
+        `Required system image is missing: android-${cfg.apiLevel};${cfg.systemImageTag};${cfg.abi}\n` +
+        "Rerun with: bun run init -- --install-sdk",
+      );
+    }
+    const imagePackage = `system-images;android-${cfg.apiLevel};${cfg.systemImageTag};${cfg.abi}`;
+    log.info(`Installing missing target system image: ${imagePackage}`);
+    const result = await runLive(sdkmanagerPath(cfg.sdkRoot, platform), [
+      `--sdk_root=${cfg.sdkRoot}`, "--install", imagePackage,
+    ]);
+    if (result !== 0 || !systemImageInstalled(cfg)) {
+      throw new Error(`Could not install required system image: ${imagePackage}`);
+    }
+    log.good("Target system image installed.");
   }
 
   if (avdExists(cfg.avdName, emuPath)) {

@@ -32,17 +32,17 @@ function cmdToolsUrl(version: string, platform: PlatformInfo): string {
 // ── sdkmanager / avdmanager paths ────────────────────────────────────────────
 
 function sdkmanagerPath(sdkRoot: string, platform: PlatformInfo): string {
-  const ext  = platform.type === "windows" ? ".bat" : "";
+  const ext  = platform.type === "windows" || platform.type === "wsl" ? ".bat" : "";
   return join(sdkRoot, "cmdline-tools", "latest", "bin", `sdkmanager${ext}`);
 }
 
 function avdmanagerPath(sdkRoot: string, platform: PlatformInfo): string {
-  const ext = platform.type === "windows" ? ".bat" : "";
+  const ext = platform.type === "windows" || platform.type === "wsl" ? ".bat" : "";
   return join(sdkRoot, "cmdline-tools", "latest", "bin", `avdmanager${ext}`);
 }
 
 function sdkToolsPresent(root: string, platform: PlatformInfo): boolean {
-  const ext = platform.type === "windows" ? ".bat" : "";
+  const ext = platform.type === "windows" || platform.type === "wsl" ? ".bat" : "";
   return [
     join(root, "platform-tools", `adb${platform.exe}`),
     join(root, "emulator", `emulator${platform.exe}`),
