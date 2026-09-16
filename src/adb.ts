@@ -7,6 +7,8 @@ import { toWinPath } from "./platform.ts";
 import type { PlatformInfo } from "./platform.ts";
 
 export class Adb {
+  private rootMode: "adbroot" | "su" | null = null;
+
   constructor(
     public readonly exePath: string,
     public readonly serial?: string,
@@ -58,11 +60,33 @@ export class Adb {
   }
 
   /**
-   * Run a shell command as root via `su -c`.
-   * Single-quotes in `cmd` must be pre-escaped by the caller.
+   * Run a shell command as root.
+   *
+   * There are two distinct kinds of "rooted" device this lab targets:
+   *   - `adb root`-rooted emulators (the default for this lab's own
+   *     non-Play-Store system images): adbd itself restarts as root, the
+   *     plain `adb shell` session is already uid=0, and there is usually
+   *     no `su` binary installed at all.
+   *   - Magisk/su-rooted devices (physical hardware, Play-Store images,
+   *     rootAVD): the base shell is unprivileged; `su -c '<cmd>'` is
+   *     required to elevate.
+   *
+   * Always wrapping in `su -c` (the previous behavior) silently no-ops on
+   * the first kind — `su: not found` inside `adb shell`, but neither
+   * `shell()` nor `rootShell()` surface exit codes, so callers like
+   * `chmod 755 <frida-server>` would appear to succeed while doing
+   * nothing. Detect which mode applies once (cached) and only pay the
+   * `su -c` wrapping (with its extra quoting requirements) when it's
+   * actually needed.
+   *
+   * Single-quotes in `cmd` must be pre-escaped by the caller (only
+   * relevant in `su` mode).
    */
   rootShell(cmd: string): string {
-    return this.shell(`su -c '${cmd}'`);
+    if (this.rootMode === null) {
+      this.rootMode = /uid=0/.test(this.shell("id")) ? "adbroot" : "su";
+    }
+    return this.rootMode === "adbroot" ? this.shell(cmd) : this.shell(`su -c '${cmd}'`);
   }
 
   // ── File transfer ─────────────────────────────────────────────────────────
@@ -137,16 +161,34 @@ export class Adb {
   // ── Root verification ─────────────────────────────────────────────────────
 
   /**
-   * Verify Magisk/su root is available.
+   * Verify root is available, trying the cheapest method first.
    * Throws with a helpful message if the AVD is not rooted.
    */
   verifyRoot(): void {
     log.info("Verifying root…");
-    const id  = this.shell("id");
+    let id = this.shell("id");
     log.info(`  adb shell id  → ${id}`);
 
     if (/uid=0/.test(id)) {
       log.good("ADB shell is root (userdebug image).");
+      return;
+    }
+
+    // Non-Play-Store emulator system images (the lab's default
+    // systemImageTag) are userdebug builds where `adb root` alone restarts
+    // adbd as root — no Magisk/rootAVD needed. This is a no-op (and fails
+    // harmlessly) on Play-Store images and real hardware, so it's always
+    // safe to try before falling back to su.
+    log.info("  adb shell id was not root — trying `adb root`…");
+    this.exec("root");
+    for (let i = 0; i < 10; i++) {
+      Bun.sleepSync(500);
+      if (this.getEmulator()) break; // adbd back online
+    }
+    id = this.shell("id");
+    log.info(`  adb shell id  → ${id}`);
+    if (/uid=0/.test(id)) {
+      log.good("`adb root` grants root (userdebug emulator image).");
       return;
     }
 

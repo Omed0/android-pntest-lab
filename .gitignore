@@ -16,3 +16,7 @@ cert/*.cer
 cert/*.crt
 cert/*.der
 cert/*.pem
+
+# Disposable verification workspaces (may contain extracted/pulled APK
+# content — never committed, see README "Safety")
+testing/

@@ -42,13 +42,39 @@ Install or provide:
 
 - Bun 1.4 or newer.
 - Burp Suite with a listener reachable by the target emulator.
-- A rooted target AVD, or an approved userdebug/Magisk/rootAVD setup.
 - Network access for first-run SDK, Frida, and system-image downloads.
 
-The project can download Android command-line tools, Platform Tools, Emulator,
-and configured system images. It does not silently execute an arbitrary rooting
-script: root preparation is image/build-specific and must be performed once by
-the operator.
+Everything else below is either already automated or self-healing on
+`--install-sdk`:
+
+| Dependency | Handled how |
+|---|---|
+| Java (JRE/JDK) | Detected before touching `sdkmanager`/`avdmanager` (both are Java programs); auto-installed via `winget install EclipseAdoptium.Temurin.21.JRE` on Windows with `--install-sdk`, otherwise a clear manual-install message. |
+| Python + pip | Same pattern, used to `pip install frida frida-tools`; falls back to `winget install Python.Python.3.13` on Windows if pip isn't found at all. |
+| 7-Zip (Windows only) | Auto-installed via `winget install 7zip.7zip` with `--install-sdk`; `.zip` extraction still falls back to the built-in `Expand-Archive` if 7-Zip can't be installed, but `.xz` (frida-server's format) has no fallback and needs it. |
+| Android cmdline-tools / Platform-Tools / Emulator / system images | Downloaded and installed by `sdkmanager` under `--install-sdk`, cached under `tools/cache/`. |
+| Root | Auto-detected per device — see **Root: two kinds, handled automatically** below. Never silently attempts an arbitrary rooting exploit. |
+
+### Root: two kinds, handled automatically
+
+There are two legitimately different "rooted" devices this project targets,
+and the tooling now tells them apart itself instead of assuming one:
+
+- **`adb root`-rooted emulators** — this is what you get for free from the
+  lab's own default (`google_apis`, non-Play-Store) system image: it's a
+  userdebug build where `adb root` alone restarts `adbd` as root, no Magisk
+  or rootAVD needed. `bun run bootstrap`/`init` try this automatically
+  before falling back to anything else — **for the default configuration,
+  root now requires zero manual steps.**
+- **Magisk/su-rooted devices** — physical hardware, Play-Store images, or a
+  rootAVD-prepared AVD. The base shell is unprivileged; `su -c '<cmd>'` is
+  required. The tooling falls back to this automatically when `adb root`
+  doesn't grant `uid=0` (e.g. it's a no-op on production/Play-Store builds).
+
+You don't pass a flag for which kind you have — `verifyRoot()` tries `adb
+shell id` -> `adb root` -> `su -c id` in that order and uses whichever
+succeeds, then every later root-only command uses that same mode. If none
+of the three work, it tells you to prepare the AVD with rootAVD/Magisk.
 
 ## First run
 
@@ -81,14 +107,68 @@ when the required SDK tools are available, starts the emulators, verifies the
 target is rooted, installs host Frida, downloads the matching `frida-server`,
 and verifies target-specific Frida communication.
 
-Verify root directly when preparing a new target:
+Verify root directly at any time — this works for both root kinds described
+above (it's exactly what `bun run verify` checks):
 
 ```powershell
 $adb = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
-& $adb -s $env:LAB_TARGET_SERIAL shell su -c id
+& $adb -s $env:LAB_TARGET_SERIAL shell id            # uid=0 here = adb-root image
+& $adb -s $env:LAB_TARGET_SERIAL shell su -c id       # uid=0 here = Magisk/rootAVD image
 ```
 
-Continue only when the output contains `uid=0(root)`.
+Continue once either command's output contains `uid=0(root)`.
+
+### Using your own existing AVD (rooted or Play Store) instead
+
+If you already have an AVD you'd rather reuse — your own rooted target, or
+a Play Store AVD you built by hand — point the lab at it by name instead of
+letting it create one. `avdExists()` is checked before any AVD is created,
+so an existing AVD with the configured name is reused as-is and never
+recreated or modified:
+
+```powershell
+$env:LAB_AVD_NAME = "<your-existing-rooted-avd-name>"
+$env:LAB_SOURCE_AVD = "<your-existing-playstore-avd-name>"
+bun run init
+```
+
+To create a fresh non-rooted Play Store AVD yourself (no lab code needed —
+just the SDK the lab already manages):
+
+```powershell
+$SDK = "$env:LOCALAPPDATA\Android\Sdk"
+& "$SDK\cmdline-tools\latest\bin\sdkmanager.bat" --install "system-images;android-36.1;google_apis_playstore_ps16k;x86_64"
+& "$SDK\cmdline-tools\latest\bin\avdmanager.bat" create avd --name PlayStore_Source --package "system-images;android-36.1;google_apis_playstore_ps16k;x86_64" --device pixel_7_pro --force
+& "$SDK\emulator\emulator.exe" -avd PlayStore_Source -gpu host
+```
+
+Play Store images are intentionally locked down by Google (no `adb root`,
+no Magisk) — that's expected, not a limitation of this project. It's exactly
+why this is the separate **source** role: install the real app there once
+(interactive Google sign-in, one **Install** tap), then `bun run transfer`
+or `bun run e2e` hands it off to your separate rooted **target** for actual
+testing. The two roles are deliberately never the same device.
+
+**Device profile note:** `--device <id>` above must be an id your installed
+`cmdline-tools` actually knows about — run `avdmanager list device` to see
+them. The auto-downloaded "command-line tools only" package ships an older,
+fixed device list than Android Studio does, so a literal `pixel_10_pro` (or
+other very new device id) frequently doesn't exist yet even though it's
+valid on a Studio-managed SDK. The lab's own `ensureAvd()`/`ensureSourceAvd()`
+now resolve this automatically (falling back to the newest available
+`pixel_*_pro` profile with a warning instead of hard-failing) — this note is
+only for when you're running `avdmanager` by hand as above.
+
+**First-boot timing:** a Play Store AVD's very first boot has no boot
+snapshot yet and has to cold-start Google Play services — this measured at
+well over 5 minutes on this project's own test machine, longer than you'd
+expect from later boots (which reuse the snapshot and are fast). `bun run
+init`'s default source-boot timeout accounts for this; override with
+`--timeout=<sec>` if your machine needs even longer. Give the emulator a
+minute after `sys.boot_completed=1` before installing anything — the
+package/activity manager services can still be settling immediately after
+that property flips, especially on a loaded host running two emulators at
+once.
 
 ## One-command E2E run
 
@@ -186,6 +266,7 @@ LAB_TARGET_SERIAL       rooted target ADB serial
 LAB_SOURCE_SERIAL       Play Store source ADB serial
 LAB_SOURCE_AVD          Play Store source AVD name
 LAB_SOURCE_IMAGE_PACKAGE Play Store source image package
+LAB_SOURCE_DEVICE_PROFILE Preferred source device profile [pixel_7_pro]
 LAB_SDK_ROOT            auto-detected Android SDK
 LAB_API_LEVEL           33
 LAB_ABI                 x86_64
@@ -240,14 +321,15 @@ android-pentest-lab/
   package.json             Bun commands and dependencies
   run.ts                   App launch, Burp, certificate, and Frida attach
   verify.ts                Target health check
-  scripts/hook.js          Optional Frida hook
+  scripts/hook.js          Minimal placeholder Frida hook
+  scripts/ssl-unpinning.js Universal SSL/TLS pinning bypass (see below)
   src/
     lab.ts                 Lifecycle commands and orchestration
-    transfer.ts            Split APK transfer
-    adb.ts                 Serial-aware ADB wrapper
-    avd.ts                 AVD creation and startup
+    transfer.ts            Split APK transfer (source -> target)
+    adb.ts                 Serial-aware ADB wrapper, root-mode detection
+    avd.ts                 AVD creation/startup, device-profile resolution
     config.ts              Defaults, flags, and LAB_* variables
-    download.ts            Download/extraction helpers
+    download.ts            Download/extraction helpers, Java/7-Zip bootstrap
     exec.ts                Process execution
     frida.ts               Host/server Frida management
     log.ts                 Console logging
@@ -258,12 +340,65 @@ android-pentest-lab/
   tools/                   Caches and local SDK, ignored by Git
 ```
 
+## SSL/TLS pinning bypass
+
+`scripts/ssl-unpinning.js` is a generic, reusable pinning-bypass script,
+separate from `scripts/hook.js` (a minimal placeholder meant to be replaced
+per-app). Use it directly:
+
+```powershell
+bun run.ts --package=<pkg> --frida-script=scripts/ssl-unpinning.js
+```
+
+It patches OkHttp's `CertificatePinner`, `WebViewClient.onReceivedSslError`
+(covers WebView/hybrid apps), and conscrypt's `TrustManagerImpl.verifyChain`,
+skipping any hook whose target class isn't present in a given app instead of
+throwing. The `javax.net.ssl.SSLContext.init`/`TrustManager` override is
+**off by default** — see the KNOWN ISSUE comment at the top of the file: it
+has been observed to reliably crash a .NET MAUI app at process-bind time.
+Installing the Burp CA into the rooted system trust store (which `run.ts`
+already does automatically) is frequently enough on its own for apps with
+no custom pinning logic at all — try that first before enabling the
+SSLContext override.
+
 ## Troubleshooting
 
 **No target root**
 
-Prepare the target AVD with an approved rootAVD/Magisk/userdebug method, reboot,
-and confirm `su -c id` returns `uid=0(root)`.
+`bun run bootstrap` already tries `adb root` automatically before falling
+back to `su -c id` (see **Root: two kinds, handled automatically** above).
+If both fail, the AVD genuinely needs manual preparation: rootAVD/Magisk for
+a Play-Store image or physical device, or confirm you're using this
+project's default non-Play-Store `google_apis` tag for a zero-effort target.
+
+**"Error: No device found matching --device \<id\>"**
+
+The device id you (or a config default) requested isn't in the
+`avdmanager` device list this SDK install shipped — most commonly a
+literal `pixel_10_pro`/similarly-new id on the auto-downloaded "command-line
+tools only" package, which has an older, fixed device list than Android
+Studio's. `bun run bootstrap`/`init` resolve this automatically now
+(falling back to the newest available `pixel_*_pro` profile with a
+warning); if you're running `avdmanager` by hand, run `avdmanager list
+device` to see what's actually available and pick from that list.
+
+**Play Store AVD boot times out on its very first boot**
+
+A brand-new Play Store AVD has no boot snapshot yet and can take several
+minutes to cold-start Google Play services — measured well over 5 minutes
+on this project's own test machine. `bun run init`'s default source-boot
+timeout already accounts for this; raise it further with `--timeout=<sec>`
+if needed. Give it another 30-60s after `sys.boot_completed=1` before
+installing anything — package/activity manager services can still be
+settling right after that property flips.
+
+**"Can't find service: package/activity" during transfer or install**
+
+Transient system-server hiccup, most often seen right after an AVD's first
+boot or when two emulators are running at once on a loaded host — it
+recovers on its own within seconds. `src/transfer.ts`'s `adb()` helper
+already retries a few times on exactly this error class; if you hit it
+elsewhere, wait a few seconds and rerun the command.
 
 **SDK tools or image missing**
 

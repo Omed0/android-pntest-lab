@@ -63,8 +63,23 @@ Options
 `);
 }
 
+/**
+ * Under real load (two emulators booting/running at once, which is exactly
+ * this project's normal source+target setup) the system server can
+ * transiently answer "Can't find service: <x>" or drop the binder
+ * connection ("Broken pipe") for a moment right after boot or right after
+ * an install/uninstall — observed directly, repeatedly, on this project's
+ * own emulator pair. It always recovers within a few seconds. Retry a
+ * couple of times on that specific class of error instead of hard-failing
+ * the whole transfer on a hiccup that would have gone away on its own.
+ */
 function adb(adbPath: string, serial: string, ...args: string[]) {
-  return run(adbPath, ["-s", serial, ...args]);
+  let r = run(adbPath, ["-s", serial, ...args]);
+  for (let i = 0; !r.ok && /Can't find service|Broken pipe/i.test(r.stderr) && i < 3; i++) {
+    Bun.sleepSync(2_000);
+    r = run(adbPath, ["-s", serial, ...args]);
+  }
+  return r;
 }
 
 function assertDevice(adbPath: string, serial: string, label: string): void {

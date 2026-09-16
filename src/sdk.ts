@@ -14,9 +14,55 @@ import { existsSync, mkdirSync, renameSync } from "fs";
 import { join, basename } from "path";
 import { log } from "./log.ts";
 import { run, runWithStdin, runLive } from "./exec.ts";
-import { downloadFile, extractZip } from "./download.ts";
+import { downloadFile, extractZip, ensure7z } from "./download.ts";
 import type { LabConfig } from "./config.ts";
 import type { PlatformInfo } from "./platform.ts";
+
+// ── Java (required by sdkmanager.bat/avdmanager.bat, never checked before) ────
+
+/**
+ * `sdkmanager`/`avdmanager` are themselves Java programs — their .bat/shell
+ * wrappers fail with a plain "JAVA_HOME is not set and no 'java' command
+ * could be found" if no JRE/JDK is present. This was previously never
+ * checked or installed by this project at all, so a genuinely bare machine
+ * (no Java, no Android Studio) would fail at the very first cmdline-tools
+ * invocation with a raw batch-script error instead of a clear, actionable
+ * message — or, when `--install-sdk`/winget are available, installs one.
+ */
+export async function ensureJava(cfg: LabConfig): Promise<void> {
+  if (run("java", ["-version"]).exitCode === 0 || run("java", ["-version"]).stderr.includes("version")) return;
+
+  log.warn("Java runtime not found — required by sdkmanager/avdmanager.");
+  if (!cfg.installSdk) {
+    throw new Error(
+      "Java (JRE/JDK) not found and is required to run the Android cmdline-tools.\n\n" +
+      "Install one and rerun, or rerun with --install-sdk to auto-install via winget:\n" +
+      "  Windows: winget install EclipseAdoptium.Temurin.21.JRE\n" +
+      "  Linux:   sudo apt install default-jre\n" +
+      "  macOS:   brew install openjdk",
+    );
+  }
+
+  if (process.platform === "win32" && run("winget", ["--version"]).ok) {
+    log.info("Installing a JRE via winget…");
+    const code = await runLive("winget", [
+      "install", "--id", "EclipseAdoptium.Temurin.21.JRE", "--exact",
+      "--silent", "--accept-source-agreements", "--accept-package-agreements",
+    ]);
+    if (code === 0 && (run("java", ["-version"]).exitCode === 0 || run("java", ["-version"]).stderr.includes("version"))) {
+      log.good("Java installed.");
+      return;
+    }
+  }
+
+  throw new Error(
+    "Could not find or install Java automatically.\n" +
+    "Install a JRE/JDK manually and rerun:\n" +
+    "  Windows: winget install EclipseAdoptium.Temurin.21.JRE\n" +
+    "  Linux:   sudo apt install default-jre\n" +
+    "  macOS:   brew install openjdk",
+  );
+}
 
 // ── Cmdline-tools download URLs ───────────────────────────────────────────────
 
@@ -94,6 +140,8 @@ export async function ensureSdk(
   platform: PlatformInfo,
 ): Promise<string> {
   log.step("Android SDK");
+  await ensureJava(cfg);
+  await ensure7z(cfg, platform);
 
   const existing = findSdk(cfg, platform);
   if (existing) {
@@ -157,15 +205,43 @@ async function installHeadlessSdk(
     run("rm", ["-rf", latestDest]);          // Linux/macOS/WSL
     run("powershell", ["-Command", `Remove-Item -Recurse -Force '${latestDest}'`]); // Windows
   }
-  renameSync(extracted, latestDest);
+  // Freshly-extracted files can still be transiently locked on Windows
+  // (antivirus real-time scan of the newly written jars/exes) — retry the
+  // rename a few times instead of failing the whole SDK install outright.
+  // Same class of issue as the archive-lock retry in download.ts.
+  for (let i = 0; ; i++) {
+    try {
+      renameSync(extracted, latestDest);
+      break;
+    } catch (e) {
+      const isLock = e instanceof Error && /EPERM|EBUSY/.test((e as NodeJS.ErrnoException).code ?? "");
+      if (!isLock || i >= 5) throw e;
+      log.warn(`Extracted files still locked, retrying move (${i + 1}/5)…`);
+      Bun.sleepSync(1_500);
+    }
+  }
   run("rm", ["-rf", tmpDir]);
 
   log.good("cmdline-tools installed.");
 
   // 3. Accept SDK licenses
+  //
+  // IMPORTANT: do not pass `--sdk_root=<path>` on the sdkmanager.bat command
+  // line on Windows when <path> contains a space (e.g. a repo checked out
+  // under "...\mobile app\..."). Spawning a .bat file always goes through
+  // cmd.exe, and empirically an argument value containing a space here
+  // causes cmd.exe to mis-tokenize the whole invocation — it ends up trying
+  // to execute the first half of the path as a bare command
+  // ("'D:\redteam\mobile' is not recognized..."), well before the script's
+  // own `%*` handling even runs. This reproduced consistently regardless of
+  // quoting attempts. The fix: never put the SDK path on the .bat argv at
+  // all — pass it only via ANDROID_SDK_ROOT/ANDROID_HOME, which sdkmanager
+  // and avdmanager both read directly with no shell re-tokenization
+  // involved. Keep every other argument space-free (package ids, flags).
+  const sdkEnv = { ANDROID_SDK_ROOT: sdkRoot, ANDROID_HOME: sdkRoot };
   log.info("Accepting SDK licenses…");
   const sdkm = sdkmanagerPath(sdkRoot, platform);
-  await runWithStdin(sdkm, ["--licenses", `--sdk_root=${sdkRoot}`], "y\n".repeat(20));
+  await runWithStdin(sdkm, ["--licenses"], "y\n".repeat(20), { env: sdkEnv });
 
   // 4. Install required SDK packages
   const sysImage = `system-images;android-${cfg.apiLevel};${cfg.systemImageTag};${cfg.abi}`;
@@ -175,10 +251,9 @@ async function installHeadlessSdk(
   packages.forEach(p => log.info(`  ${p}`));
 
   const code = await runLive(sdkm, [
-    `--sdk_root=${sdkRoot}`,
     "--install",
     ...packages,
-  ]);
+  ], { env: sdkEnv });
 
   if (code !== 0) throw new Error("sdkmanager failed installing packages.");
   log.good("SDK packages installed.");

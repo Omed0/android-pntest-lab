@@ -55,6 +55,18 @@ export const DEFAULTS = {
   sourceAvdName:  "Pixel_10_Pro",
   /** Fallback source image; override with LAB_SOURCE_IMAGE_PACKAGE. */
   sourceImagePackage: "system-images;android-36.1;google_apis_playstore_ps16k;x86_64",
+  /**
+   * Preferred device profile for the source AVD; override with
+   * LAB_SOURCE_DEVICE_PROFILE. This is a *preference*, not a hard
+   * requirement — the auto-downloaded "command-line tools only" package
+   * ships an older device-definition list than Android Studio does, so
+   * newer ids (e.g. a literal "pixel_10_pro") frequently don't exist on a
+   * freshly-installed SDK even though they're valid on someone's
+   * Studio-managed machine. `resolveDeviceProfile()` in src/avd.ts falls
+   * back to the newest available Pixel profile instead of hard-failing
+   * when this exact id isn't present.
+   */
+  sourceDeviceProfile: "pixel_7_pro",
 
   // ── AVD ──────────────────────────────────────────────────────────────────
   /** Android Virtual Device name shown in Android Studio / avdmanager. */
@@ -126,6 +138,7 @@ export interface LabConfig {
   sourceSerial:   string;
   sourceAvdName:   string;
   sourceImagePackage: string;
+  sourceDeviceProfile: string;
 
   avdName:        string;
   apiLevel:       number;
@@ -205,6 +218,7 @@ export function loadConfig(labRoot: string, argv = process.argv.slice(2)): LabCo
     sourceSerial:   str("source-serial", DEFAULTS.sourceSerial),
     sourceAvdName:  str("source-avd", DEFAULTS.sourceAvdName),
     sourceImagePackage: str("source-image-package", DEFAULTS.sourceImagePackage),
+    sourceDeviceProfile: str("source-device-profile", DEFAULTS.sourceDeviceProfile),
 
     avdName:        str("avd-name",         DEFAULTS.avdName),
     apiLevel:       num("api-level",         DEFAULTS.apiLevel),

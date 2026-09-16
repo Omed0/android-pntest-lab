@@ -1,7 +1,7 @@
 import { existsSync } from "fs";
 import { run, runLive } from "./exec.ts";
 import { detectPlatform } from "./platform.ts";
-import { ensureAvd, listAvds, startEmulator } from "./avd.ts";
+import { ensureAvd, listAvds, resolveDeviceProfile, startEmulator } from "./avd.ts";
 import { avdmanagerPath, emulatorPath, ensureSdk, sdkmanagerPath } from "./sdk.ts";
 import { findAdb } from "./adb.ts";
 import { DEFAULTS, loadConfig, printConfig } from "./config.ts";
@@ -16,7 +16,13 @@ import {
 const DEFAULT_SOURCE_AVD = DEFAULTS.sourceAvdName;
 const DEFAULT_SOURCE_SERIAL = DEFAULTS.sourceSerial;
 const DEFAULT_SOURCE_IMAGE = DEFAULTS.sourceImagePackage;
-const DEFAULT_TIMEOUT_SEC = 300;
+// A brand-new Play Store source AVD's very first boot has no boot snapshot
+// yet and has to cold-boot Google Play Services — verified directly to take
+// well over 300s (previous default) on a fresh AVD, timing out even though
+// the emulator was booting correctly and finished a few minutes later.
+// Subsequent boots reuse the snapshot and are fast; --timeout=<sec> still
+// overrides this per-run if a given machine needs more.
+const DEFAULT_TIMEOUT_SEC = 600;
 
 export interface InitializeOptions {
   sourceAvd: string;
@@ -111,17 +117,29 @@ async function ensureSourceAvd(
   emuPath: string,
   avdName: string,
   imagePackage: string,
+  deviceProfile: string,
 ): Promise<void> {
   if (listAvds(emuPath).includes(avdName)) return;
   log.step("Play Store source AVD");
   log.info(`Source AVD '${avdName}' is missing; installing ${imagePackage}.`);
+  // See src/sdk.ts installHeadlessSdk() for why --sdk_root=<path> must
+  // never be passed on sdkmanager.bat's argv when <path> contains a space —
+  // ANDROID_SDK_ROOT/ANDROID_HOME env vars carry it instead.
   const imageCode = await runLive(sdkmanagerPath(sdkRoot, platform), [
-    `--sdk_root=${sdkRoot}`, "--install", imagePackage,
-  ]);
+    "--install", imagePackage,
+  ], { env: { ANDROID_SDK_ROOT: sdkRoot, ANDROID_HOME: sdkRoot } });
   if (imageCode !== 0) throw new Error(`Could not install source image '${imagePackage}'. Override --source-image-package.`);
-  const created = run(avdmanagerPath(sdkRoot, platform), [
+  const avdmgr = avdmanagerPath(sdkRoot, platform);
+  // Was previously hardcoded to "pixel_10_pro", which doesn't exist on the
+  // device-definition list shipped with the auto-downloaded "command-line
+  // tools only" package (only up to pixel_7_pro/pixel_tablet at the time of
+  // writing) — every from-scratch install hit "Error: No device found
+  // matching --device pixel_10_pro." resolveDeviceProfile() falls back to
+  // the newest available Pixel profile instead of hard-failing.
+  const deviceId = resolveDeviceProfile(avdmgr, deviceProfile);
+  const created = run(avdmgr, [
     "create", "avd", "--name", avdName, "--package", imagePackage,
-    "--device", "pixel_10_pro", "--force",
+    "--device", deviceId, "--force",
   ]);
   if (!created.ok && !created.stdout.includes("created")) {
     throw new Error(`Could not create source AVD:\n${created.stderr.trim() || created.stdout.trim()}`);
@@ -195,7 +213,7 @@ export async function initializeLab(labRoot: string, argv: string[]): Promise<vo
   if (!existsSync(emuPath)) throw new Error(`Android Emulator not found: ${emuPath}`);
   if (!listAvds(emuPath).includes(options.sourceAvd)) {
     if (!cfg.installSdk) throw new Error(`Source AVD '${options.sourceAvd}' was not found. Rerun with --install-sdk.`);
-    await ensureSourceAvd(sdkRoot, platform, emuPath, options.sourceAvd, options.sourceImage);
+    await ensureSourceAvd(sdkRoot, platform, emuPath, options.sourceAvd, options.sourceImage, cfg.sourceDeviceProfile);
   }
   log.step("Play Store source");
   if (isOnline(adb.exePath, options.sourceSerial)) {

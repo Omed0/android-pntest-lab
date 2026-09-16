@@ -24,6 +24,54 @@ export function avdExists(name: string, emuPath: string): boolean {
   return listAvds(emuPath).includes(name);
 }
 
+// ── Device profile resolution ──────────────────────────────────────────────────
+
+/**
+ * Return every device id `avdmanager create avd --device <id>` will accept
+ * on this SDK install, e.g. ["pixel_7_pro", "pixel_tablet", ...].
+ *
+ * This list is NOT the same across machines: the "command-line tools only"
+ * package this project auto-downloads ships an older, fixed
+ * device-definition list, while Android Studio bundles a newer one. A
+ * device id that's valid on a Studio-managed SDK (e.g. a literal
+ * "pixel_10_pro") can be completely absent on a freshly auto-installed one.
+ */
+function listDeviceIds(avdmgr: string): string[] {
+  const r = run(avdmgr, ["list", "device"]);
+  const ids: string[] = [];
+  const re = /id:\s*\d+\s+or\s+"([^"]+)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(r.stdout))) ids.push(m[1]);
+  return ids;
+}
+
+/**
+ * Resolve a device profile id for `avdmanager create avd --device <id>`,
+ * falling back gracefully instead of hard-failing when `preferred` isn't on
+ * this SDK's device list (see listDeviceIds() above for why that happens).
+ *
+ * Fallback order: the exact preferred id -> the newest available
+ * "pixel_*_pro" -> the newest available "pixel_*" -> the first device id
+ * this avdmanager knows about at all.
+ */
+export function resolveDeviceProfile(avdmgr: string, preferred: string): string {
+  const ids = listDeviceIds(avdmgr);
+  if (ids.length === 0) return preferred; // avdmanager list failed to parse — let create avd surface the real error
+
+  if (ids.includes(preferred)) return preferred;
+
+  const byNewestPixelNumber = (candidates: string[]) => candidates
+    .map(id => ({ id, n: parseInt(id.match(/pixel_(\d+)/)?.[1] ?? "-1", 10) }))
+    .sort((a, b) => b.n - a.n)[0]?.id;
+
+  const pixelPro = byNewestPixelNumber(ids.filter(id => /^pixel_\d+.*_pro$/.test(id)));
+  const pixelAny = byNewestPixelNumber(ids.filter(id => /^pixel_\d+/.test(id)));
+  const fallback = pixelPro ?? pixelAny ?? ids[0];
+
+  log.warn(`Device profile '${preferred}' is not on this SDK's device list — using '${fallback}' instead.`);
+  return fallback;
+}
+
 // ── AVD creation ──────────────────────────────────────────────────────────────
 
 /**
@@ -56,9 +104,12 @@ export async function ensureAvd(
     }
     const imagePackage = `system-images;android-${cfg.apiLevel};${cfg.systemImageTag};${cfg.abi}`;
     log.info(`Installing missing target system image: ${imagePackage}`);
+    // See src/sdk.ts installHeadlessSdk() for why --sdk_root=<path> must
+    // never be passed on sdkmanager.bat's argv when <path> contains a
+    // space — ANDROID_SDK_ROOT/ANDROID_HOME env vars carry it instead.
     const result = await runLive(sdkmanagerPath(cfg.sdkRoot, platform), [
-      `--sdk_root=${cfg.sdkRoot}`, "--install", imagePackage,
-    ]);
+      "--install", imagePackage,
+    ], { env: { ANDROID_SDK_ROOT: cfg.sdkRoot, ANDROID_HOME: cfg.sdkRoot } });
     if (result !== 0 || !systemImageInstalled(cfg)) {
       throw new Error(`Could not install required system image: ${imagePackage}`);
     }
@@ -74,18 +125,20 @@ export async function ensureAvd(
     deleteAvd(cfg.avdName, cfg.sdkRoot, platform);
   }
 
+  const avdmgr = avdmanagerPath(cfg.sdkRoot, platform);
+  const deviceId = resolveDeviceProfile(avdmgr, cfg.deviceProfile);
+
   log.info(`Creating AVD: ${cfg.avdName}`);
   log.info(`  system image: android-${cfg.apiLevel}  ${cfg.systemImageTag}/${cfg.abi}`);
-  log.info(`  device profile: ${cfg.deviceProfile}`);
+  log.info(`  device profile: ${deviceId}`);
 
-  const avdmgr = avdmanagerPath(cfg.sdkRoot, platform);
   const pkg = `system-images;android-${cfg.apiLevel};${cfg.systemImageTag};${cfg.abi}`;
 
   const r = run(avdmgr, [
     "create", "avd",
     "--name",    cfg.avdName,
     "--package", pkg,
-    "--device",  cfg.deviceProfile,
+    "--device",  deviceId,
     "--force",
   ]);
 
@@ -109,7 +162,12 @@ function deleteAvd(name: string, sdkRoot: string, platform: PlatformInfo): void 
  * config.ini so the emulator picks them up without extra CLI flags.
  */
 function applyHardwareConfig(cfg: LabConfig): void {
-  const avdHome = join(homedir(), ".android", "avd", `${cfg.avdName}.avd`);
+  // Respect ANDROID_AVD_HOME (used to relocate AVD storage, e.g. for an
+  // isolated/sandboxed lab run) instead of always assuming the default
+  // ~/.android/avd — otherwise this silently no-ops whenever AVDs live
+  // somewhere else, leaving the configured RAM/cores/disk unapplied.
+  const avdBase = process.env.ANDROID_AVD_HOME || join(homedir(), ".android", "avd");
+  const avdHome = join(avdBase, `${cfg.avdName}.avd`);
   const configFile = join(avdHome, "config.ini");
 
   if (!existsSync(configFile)) {
