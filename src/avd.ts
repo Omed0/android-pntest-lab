@@ -119,6 +119,7 @@ export async function ensureAvd(
   if (avdExists(cfg.avdName, emuPath)) {
     if (!cfg.forceAvd) {
       log.good(`AVD already exists: ${cfg.avdName}`);
+      lockEmulatorWindow(cfg, cfg.avdName, platform);
       return;
     }
     log.warn(`--force-avd set — deleting existing AVD '${cfg.avdName}' and recreating.`);
@@ -150,6 +151,7 @@ export async function ensureAvd(
 
   log.good(`AVD created: ${cfg.avdName}`);
   applyHardwareConfig(cfg);
+  lockEmulatorWindow(cfg, cfg.avdName, platform);
 }
 
 function deleteAvd(name: string, sdkRoot: string, platform: PlatformInfo): void {
@@ -158,16 +160,21 @@ function deleteAvd(name: string, sdkRoot: string, platform: PlatformInfo): void 
 }
 
 /**
+ * Resolve an AVD's data directory, respecting ANDROID_AVD_HOME (used to
+ * relocate AVD storage, e.g. for an isolated/sandboxed lab run) instead of
+ * always assuming the default ~/.android/avd.
+ */
+function avdHomeDir(avdName: string): string {
+  const avdBase = process.env.ANDROID_AVD_HOME || join(homedir(), ".android", "avd");
+  return join(avdBase, `${avdName}.avd`);
+}
+
+/**
  * Write hardware config values (RAM, cores, disk, sd-card) to the AVD's
  * config.ini so the emulator picks them up without extra CLI flags.
  */
 function applyHardwareConfig(cfg: LabConfig): void {
-  // Respect ANDROID_AVD_HOME (used to relocate AVD storage, e.g. for an
-  // isolated/sandboxed lab run) instead of always assuming the default
-  // ~/.android/avd — otherwise this silently no-ops whenever AVDs live
-  // somewhere else, leaving the configured RAM/cores/disk unapplied.
-  const avdBase = process.env.ANDROID_AVD_HOME || join(homedir(), ".android", "avd");
-  const avdHome = join(avdBase, `${cfg.avdName}.avd`);
+  const avdHome = avdHomeDir(cfg.avdName);
   const configFile = join(avdHome, "config.ini");
 
   if (!existsSync(configFile)) {
@@ -193,16 +200,138 @@ function applyHardwareConfig(cfg: LabConfig): void {
 
   writeFileSync(configFile, ini, "utf8");
   log.good(`Hardware config written (${cfg.avdRamMb} MB RAM, ${cfg.avdCores} cores).`);
+
+  // GPU must be enabled separately (see applyGpuConfig) — do it for the
+  // target AVD here right after its other hardware config.
+  applyGpuConfig(cfg.avdName);
+}
+
+/**
+ * Enable GPU emulation on an AVD's config.ini (hw.gpu.enabled=yes,
+ * hw.gpu.mode=auto).
+ *
+ * This MUST be set or the emulator falls back to a broken guest software
+ * renderer that shows a solid black/white/grey screen (and boots much
+ * slower, often past the boot timeout) — the actual root cause of both the
+ * "black screen" and the "source AVD times out" problems on this project's
+ * machine. `avdmanager create avd` (headless) defaults hw.gpu.enabled=no,
+ * unlike Android Studio's AVD wizard which writes yes/auto. Applying this to
+ * *every* AVD the lab uses (target AND the Play Store source) makes them
+ * render on the host GPU and boot in seconds. Safe to call repeatedly and on
+ * an already-existing AVD.
+ */
+export function applyGpuConfig(avdName: string): void {
+  const configFile = join(avdHomeDir(avdName), "config.ini");
+  if (!existsSync(configFile)) {
+    log.warn(`config.ini not found for ${avdName} — cannot enable GPU (${configFile}).`);
+    return;
+  }
+  let ini = readFileSync(configFile, "utf8");
+  const setKey = (key: string, value: string) => {
+    const re = new RegExp(`^${key}=.*$`, "m");
+    ini = re.test(ini) ? ini.replace(re, `${key}=${value}`) : ini + `\n${key}=${value}`;
+  };
+  setKey("hw.gpu.enabled", "yes");
+  setKey("hw.gpu.mode",    "auto");
+  writeFileSync(configFile, ini, "utf8");
+  log.good(`GPU enabled for AVD: ${avdName}`);
+}
+
+/**
+ * Pin the emulator window to a fixed position/scale and lock it read-only,
+ * so the emulator can't overwrite it with wherever the window happened to
+ * be on last clean shutdown (it rewrites emulator-user.ini every time).
+ * Safe to call every run: strips read-only, rewrites the same values,
+ * re-locks — a no-op in effect once already applied. No-op entirely if
+ * `cfg.lockWindow` is false.
+ */
+export function lockEmulatorWindow(cfg: LabConfig, avdName: string, platform: PlatformInfo): void {
+  if (!cfg.lockWindow) return;
+
+  const avdHome = avdHomeDir(avdName);
+  const iniPath = join(avdHome, "emulator-user.ini");
+
+  if (!existsSync(avdHome)) return; // AVD doesn't exist yet — nothing to lock
+
+  if (platform.type === "windows") run("attrib", ["-R", iniPath]);
+  else run("chmod", ["644", iniPath]);
+
+  // Preserve an existing uuid (if the emulator already ran once and wrote
+  // one) so AVD Manager/the emulator keep recognizing this AVD instance.
+  let existingUuid: string | null = null;
+  if (existsSync(iniPath)) {
+    const match = readFileSync(iniPath, "utf8").match(/^uuid\s*=\s*(.+)$/m);
+    if (match) existingUuid = match[1].trim();
+  }
+
+  const lines = [
+    `window.x = ${cfg.windowX}`,
+    `window.y = ${cfg.windowY}`,
+    `window.scale = ${cfg.windowScale.toFixed(6)}`,
+    "resizable.config.id = -1",
+    "posture = 0",
+  ];
+  if (existingUuid) lines.push(`uuid = ${existingUuid}`);
+
+  writeFileSync(iniPath, lines.join("\n") + "\n", "utf8");
+
+  if (platform.type === "windows") run("attrib", ["+R", iniPath]);
+  else run("chmod", ["444", iniPath]);
+
+  log.good(`Emulator window locked: x=${cfg.windowX} y=${cfg.windowY} scale=${cfg.windowScale}`);
 }
 
 // ── Emulator launch ───────────────────────────────────────────────────────────
 
 /**
- * Start the emulator in the background with no visible window.
+ * Launch the emulator on Windows via PowerShell `Start-Process`, returning
+ * its PID.
  *
- * On Windows: delegates to PowerShell `Start-Process -WindowStyle Hidden` so
- *             no console window flashes.
- * On Linux/WSL/macOS: spawns with ignored stdio so the parent can exit freely.
+ * `emulator.exe` is a console-subsystem binary. Redirecting its stdio alone
+ * (a prior attempt) does NOT stop Windows from allocating it a console
+ * window — confirmed directly, the window still appeared, just empty since
+ * the text was going to the redirected log files instead. `-WindowStyle`
+ * only controls the show-state of whatever window is allocated; it cannot
+ * suppress the console window's *creation*. `-NoNewWindow` is the actual
+ * PowerShell switch for that (maps to a plain CreateProcess with no console
+ * allocated at all) — it reuses/attaches to no console rather than opening
+ * one, while the emulator's own separate Qt/skin display window is
+ * unaffected (window creation, not console allocation) and still shows.
+ * `-NoNewWindow` and `-WindowStyle` are mutually exclusive PowerShell
+ * parameters, so `showWindow=false` still needs the old `-WindowStyle
+ * Hidden` path (which hides the display window too — that's the intent of
+ * "hidden").
+ */
+export function launchWindowsEmulator(
+  emuPath: string,
+  args: string[],
+  avdName: string,
+  cacheDir: string,
+  showWindow: boolean,
+): number {
+  mkdirSync(cacheDir, { recursive: true });
+  const stdoutLog = join(cacheDir, `emulator-${avdName}.stdout.log`);
+  const stderrLog = join(cacheDir, `emulator-${avdName}.stderr.log`);
+  const argStr = args.map(a => `'${a}'`).join(",");
+  const windowFlag = showWindow ? "-NoNewWindow" : "-WindowStyle Hidden";
+  const ps = `(Start-Process -FilePath '${emuPath}' -ArgumentList ${argStr} ` +
+    `-RedirectStandardOutput '${stdoutLog}' -RedirectStandardError '${stderrLog}' ` +
+    `${windowFlag} -PassThru).Id`;
+  const r = run("powershell", ["-NoProfile", "-Command", ps]);
+  const pid = parseInt(r.stdout.trim(), 10);
+  return isNaN(pid) ? 0 : pid;
+}
+
+/**
+ * Start the emulator in the background.
+ *
+ * On Windows: delegates to PowerShell `Start-Process -PassThru`, visible by
+ *             default (`cfg.showWindow`) so first-run interaction (Play
+ *             Store sign-in, manually using an app to generate traffic)
+ *             doesn't require hunting for a hidden window; pass
+ *             `--no-show-window` to go back to a hidden launch.
+ * On Linux/WSL/macOS: spawns with ignored stdio so the parent can exit freely
+ *             (window visibility there is up to the desktop environment).
  *
  * Returns the PID of the emulator process (best-effort; 0 if not determinable).
  *
@@ -221,19 +350,30 @@ export async function startEmulator(
     "-avd",         cfg.avdName,
     "-no-boot-anim",
     "-no-audio",
+    // Always cold-boot and never save/load a boot snapshot. A snapshot saved
+    // from an emulator that was force-killed mid-shutdown (which happened
+    // repeatedly during debugging) restores into a half-ready state:
+    // sys.boot_completed never flips to 1, `adb shell` returns empty, and
+    // screencap fails — which then broke the root check and renderer check.
+    // Cold-booting every time is a bit slower but reliable and reproducible,
+    // which is what a lab wants.
+    "-no-snapshot",
     "-gpu",         gpuModeOverride ?? cfg.gpuMode,
+    // NOTE: deliberately NOT passing -writable-system. It was confirmed to
+    // trigger a broken/hung boot on this project's Android 13 image (boot
+    // stalls right after WHPX init, never reaches graphics/boot-complete;
+    // removing it boots in ~20-36s with the GPU engaged). The Burp CA is
+    // instead installed via a tmpfs overlay on /system/etc/security/cacerts
+    // (see Adb.installSystemCert() in src/adb.ts), which needs only `adb
+    // root` — no writable-system, no dm-verity disable, no reboot.
   ];
 
   log.info(`Launching emulator: ${cfg.avdName}`);
 
   if (platform.type === "windows") {
-    // PowerShell Start-Process: window hidden, returns PID via -PassThru.
-    const argStr = args.map(a => `'${a}'`).join(",");
-    const ps = `(Start-Process -FilePath '${emuPath}' -ArgumentList ${argStr} -WindowStyle Hidden -PassThru).Id`;
-    const r = run("powershell", ["-NoProfile", "-Command", ps]);
-    const pid = parseInt(r.stdout.trim(), 10);
-    log.good(`Emulator started (Windows, PID=${isNaN(pid) ? "?" : pid}).`);
-    return isNaN(pid) ? 0 : pid;
+    const pid = launchWindowsEmulator(emuPath, args, cfg.avdName, cfg.cacheDir, cfg.showWindow);
+    log.good(`Emulator started (Windows, PID=${pid || "?"}).`);
+    return pid;
   }
 
   // Linux / macOS / WSL — Bun.spawn with ignored stdio.
@@ -256,4 +396,67 @@ export async function startEmulator(
  */
 export function killEmulator(adbPath: string, serial: string): void {
   run(adbPath, ["-s", serial, "emu", "kill"]);
+}
+
+/**
+ * Bring the emulator's Qt display window up, maximized, and keep it there
+ * (Windows only).
+ *
+ * The emulator window (title "Android Emulator - <avd>:<port>", owned by the
+ * qemu-system-* process) was observed dropping behind / appearing minimized
+ * during a script run — focus-stealing from the many adb/powershell
+ * subprocesses in the flow. The user wants it up and maximized the whole
+ * time. This maximizes it (ShowWindow SW_SHOWMAXIMIZED=3), forces it to the
+ * foreground (a brief HWND_TOPMOST/NOTOPMOST toggle so it actually rises,
+ * not just flashes in the taskbar), and is called as the LAST step of each
+ * flow (and right before the Frida attach in run.ts) so nothing runs
+ * afterward to bury it again. Best-effort; no-op on non-Windows or when the
+ * window isn't found. Not left permanently topmost so the user can still
+ * click over to Burp/other tools.
+ */
+export function bringEmulatorWindowToFront(avdName: string): void {
+  if (process.platform !== "win32") return;
+  // The emulator's Qt window enforces a max size (phone aspect ratio), so
+  // SW_SHOWMAXIMIZED is silently ignored — the reliable action is SW_RESTORE
+  // (un-minimize) + raise to foreground. Target the window BY AVD NAME (its
+  // title is "Android Emulator - <avd>:<port>"), not just the first qemu
+  // window, so with two emulators up we raise the right one. AttachThreadInput
+  // to the current foreground thread is what lets SetForegroundWindow take
+  // from a background (bun/powershell) process. Retry a few times since the
+  // window handle can lag right after boot.
+  const ps = `
+$ErrorActionPreference='SilentlyContinue'
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class LabWin {
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, IntPtr pid);
+  [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+  [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
+  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
+}
+"@
+$raised=$false
+for ($i=0; $i -lt 8 -and -not $raised; $i++) {
+  $w = Get-Process qemu-system-x86_64 -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -like '*${avdName}*' } | Select-Object -First 1
+  if ($w) {
+    $h = $w.MainWindowHandle
+    $fg = [LabWin]::GetForegroundWindow()
+    $ct = [LabWin]::GetCurrentThreadId()
+    $ft = [LabWin]::GetWindowThreadProcessId($fg, [IntPtr]::Zero)
+    [LabWin]::AttachThreadInput($ft, $ct, $true) | Out-Null
+    [LabWin]::ShowWindow($h, 9) | Out-Null   # SW_RESTORE (un-minimize)
+    [LabWin]::BringWindowToTop($h) | Out-Null
+    [LabWin]::SetForegroundWindow($h) | Out-Null
+    [LabWin]::AttachThreadInput($ft, $ct, $false) | Out-Null
+    $raised=$true
+  } else { Start-Sleep -Milliseconds 800 }
+}
+if ($raised) { Write-Output "raised" } else { Write-Output "no-window" }`;
+  const r = run("powershell", ["-NoProfile", "-Command", ps]);
+  if (r.stdout.includes("raised")) log.good(`Emulator window brought to front: ${avdName}`);
+  else log.warn(`Could not find the emulator window to raise (${avdName}).`);
 }

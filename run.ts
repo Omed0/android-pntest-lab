@@ -26,6 +26,7 @@ import { log, fail } from "./src/log.ts";
 import { detectPlatform } from "./src/platform.ts";
 import { DEFAULTS, loadConfig, printConfig } from "./src/config.ts";
 import { findAdb } from "./src/adb.ts";
+import { bringEmulatorWindowToFront } from "./src/avd.ts";
 import {
   activatePortablePython,
   getHostFridaVersion,
@@ -293,26 +294,17 @@ async function ensureBurpCertificate(
   }
 
   const { hash, derPath } = prepareAndroidCertificate(labRoot, certPath);
-  const marker = `/data/local/tmp/.android-pentest-lab-burp-cert-${hash}`;
-  const destination = `/system/etc/security/cacerts/${hash}.0`;
-  if (adb.rootShell(`test -f ${marker} && test -f ${destination} && echo YES || true`) === "YES") {
-    log.good(`Burp system CA already installed: ${destination}`);
-    return;
+  log.info(`Using proxy CA: ${certPath}`);
+  log.info(`Installing into system trust store as ${hash}.0 (tmpfs overlay, no writable-system/reboot)…`);
+  const ok = adb.installSystemCert(derPath, hash, (local, remote) => adb.push(local, remote, platform));
+  if (!ok) {
+    throw new Error(
+      "Proxy CA was not installed into the system trust store.\n" +
+      "The device must be rooted (it is, per the root check). As a fallback you can\n" +
+      "intercept HTTPS via the Frida SSL-unpinning script: --frida-script=scripts/ssl-unpinning.js",
+    );
   }
-
-  const remote = "/data/local/tmp/android-pentest-lab-burp-ca.der";
-  log.info(`Using Burp CA: ${certPath}`);
-  adb.push(derPath, remote, platform);
-  log.info(`Installing rooted system CA: ${destination}`);
-  const remount = adb.rootShell("mount -o rw,remount /system 2>/dev/null || mount -o rw,remount / 2>/dev/null || true");
-  adb.rootShell(`mkdir -p /system/etc/security/cacerts && cp ${remote} ${destination} && chmod 644 ${destination} && chown 0:0 ${destination} && chcon u:object_r:system_file:s0 ${destination} 2>/dev/null || true`);
-  adb.rootShell(`rm -f ${remote}`);
-  const installed = adb.rootShell(`test -f ${destination} && stat -c '%a' ${destination} 2>/dev/null | grep -q 644 && echo YES || true`);
-  if (installed !== "YES") {
-    throw new Error(`Burp CA was not installed in the rooted system trust store. Remount output: ${remount}`);
-  }
-  adb.rootShell(`touch ${marker}`);
-  log.good(`Burp system CA installed and verified: ${destination}`);
+  log.good(`Proxy system CA installed: /system/etc/security/cacerts/${hash}.0`);
 }
 
 // ── App launch ────────────────────────────────────────────────────────────────
@@ -555,6 +547,11 @@ async function main(): Promise<void> {
       log.info(`Using default hook script: ${defaultScript}`);
     }
   }
+
+  // Raise + maximize the emulator window right before handing off to the
+  // Frida REPL, so the app is visible and on top while you interact with it
+  // to generate traffic (the Frida REPL runs in this terminal behind it).
+  bringEmulatorWindowToFront(cfg.avdName);
 
   // ── 8. Attach Frida ────────────────────────────────────────────────────────
   await attachFrida(runOpts.package, adb, cfg.targetSerial, fridaScript, runOpts.spawnMode, runOpts.verbose);

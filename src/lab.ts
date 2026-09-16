@@ -1,9 +1,9 @@
 import { existsSync } from "fs";
 import { run, runLive } from "./exec.ts";
 import { detectPlatform } from "./platform.ts";
-import { ensureAvd, killEmulator, listAvds, resolveDeviceProfile, startEmulator } from "./avd.ts";
+import { applyGpuConfig, bringEmulatorWindowToFront, ensureAvd, killEmulator, launchWindowsEmulator, listAvds, lockEmulatorWindow, resolveDeviceProfile, startEmulator } from "./avd.ts";
 import { avdmanagerPath, emulatorPath, ensureSdk, sdkmanagerPath } from "./sdk.ts";
-import { findAdb } from "./adb.ts";
+import { Adb, findAdb } from "./adb.ts";
 import { DEFAULTS, loadConfig, printConfig } from "./config.ts";
 import { fail, log } from "./log.ts";
 import {
@@ -98,14 +98,17 @@ function waitForBoot(adbPath: string, serial: string, timeoutSec: number): void 
   throw new Error(`${serial} did not finish booting within ${timeoutSec}s.`);
 }
 
-function startSourceEmulator(emuPath: string, avdName: string, platformType: string, gpuMode: string): void {
-  const args = ["-avd", avdName, "-no-boot-anim", "-no-audio", "-gpu", gpuMode];
+function startSourceEmulator(emuPath: string, avdName: string, platformType: string, gpuMode: string, showWindow: boolean, cacheDir: string): void {
+  // -no-snapshot + (no) -writable-system: see the matching comments in src/avd.ts startEmulator().
+  const args = ["-avd", avdName, "-no-boot-anim", "-no-audio", "-no-snapshot", "-gpu", gpuMode];
   log.info(`Starting source emulator: ${avdName}`);
   if (platformType === "windows") {
-    const argStr = args.map(arg => `'${arg}'`).join(",");
-    const command = `(Start-Process -FilePath '${emuPath}' -ArgumentList ${argStr} -WindowStyle Hidden -PassThru).Id`;
-    const result = run("powershell", ["-NoProfile", "-Command", command]);
-    if (!result.ok) throw new Error(`Could not start source emulator: ${result.stderr.trim()}`);
+    // See launchWindowsEmulator() in src/avd.ts for why this redirects
+    // stdio instead of just setting -WindowStyle: it's what stops Windows
+    // from also popping up a bare console/terminal window alongside the
+    // emulator's own display window.
+    const pid = launchWindowsEmulator(emuPath, args, avdName, cacheDir, showWindow);
+    if (!pid) throw new Error("Could not start source emulator (no PID returned).");
     return;
   }
   Bun.spawn([emuPath, ...args], { stdout: "ignore", stderr: "ignore", stdin: "ignore" });
@@ -192,6 +195,16 @@ export async function bootstrapLab(labRoot: string, argv: string[] = process.arg
     adb.waitForBoot(cfg.emulatorBootTimeoutSec);
   }
 
+  // Sanity-check the display renderer (warn only). The real black-screen
+  // cause was hw.gpu.enabled=no in the AVD config, now fixed in
+  // applyHardwareConfig() — so a healthy render is expected here. This stays
+  // a non-fatal warning rather than auto-switching to swiftshader: with GPU
+  // properly enabled, switching to software rendering would make a working
+  // display worse, and rendering never blocks Frida/ADB/proxy work anyway.
+  if (weStartedIt && !adb.rendererHealthy()) {
+    log.warn("Emulator display renderer check did not pass (screencap failed). If the screen is black/white/grey, try --gpu-mode=swiftshader_indirect, or confirm hw.gpu.enabled=yes in the AVD's config.ini. Frida/ADB/proxy functionality is unaffected.");
+  }
+
   log.step("Root");
   adb.verifyRoot();
   const fridaVersion = await ensureFridaHost(cfg, platform);
@@ -203,6 +216,9 @@ export async function bootstrapLab(labRoot: string, argv: string[] = process.arg
   log.step("Final check");
   verifyFridaConnection(cfg.targetSerial);
   log.good(`LAB READY: ${cfg.avdName} / Android ${adb.getAndroidVersion()} / Frida ${fridaVersion}`);
+  // Raise + maximize the emulator window as the very last action, so none of
+  // the root/frida/adb steps above (which steal focus) leave it buried.
+  if (weStartedIt && cfg.showWindow) bringEmulatorWindowToFront(cfg.avdName);
 }
 
 export async function initializeLab(labRoot: string, argv: string[]): Promise<void> {
@@ -235,11 +251,17 @@ export async function initializeLab(labRoot: string, argv: string[]): Promise<vo
     if (!cfg.installSdk) throw new Error(`Source AVD '${options.sourceAvd}' was not found. Rerun with --install-sdk.`);
     await ensureSourceAvd(sdkRoot, platform, emuPath, options.sourceAvd, options.sourceImage, cfg.sourceDeviceProfile);
   }
+  // Enable GPU on the source AVD too — unconditionally, so a source AVD that
+  // already existed from a prior run (ensureSourceAvd early-returns for it)
+  // still gets GPU turned on. Without this the Pixel 10 Pro source kept
+  // hw.gpu.enabled=no and hung in software rendering until the boot timeout.
+  applyGpuConfig(options.sourceAvd);
+  lockEmulatorWindow(cfg, options.sourceAvd, platform);
   log.step("Play Store source");
   if (isOnline(adb.exePath, options.sourceSerial)) {
     log.good(`Source emulator already connected: ${options.sourceSerial}`);
   } else {
-    startSourceEmulator(emuPath, options.sourceAvd, platform.type, cfg.gpuMode);
+    startSourceEmulator(emuPath, options.sourceAvd, platform.type, cfg.gpuMode, cfg.showWindow, cfg.cacheDir);
     try {
       waitForBoot(adb.exePath, options.sourceSerial, options.timeoutSec);
     } catch (error) {
@@ -248,9 +270,20 @@ export async function initializeLab(labRoot: string, argv: string[]): Promise<vo
       log.warn("Source emulator boot timed out — retrying once with software rendering (-gpu swiftshader_indirect), common on VMs like VMware…");
       killEmulator(adb.exePath, options.sourceSerial);
       Bun.sleepSync(3_000);
-      startSourceEmulator(emuPath, options.sourceAvd, platform.type, "swiftshader_indirect");
+      startSourceEmulator(emuPath, options.sourceAvd, platform.type, "swiftshader_indirect", cfg.showWindow, cfg.cacheDir);
       waitForBoot(adb.exePath, options.sourceSerial, options.timeoutSec);
     }
+
+    // Display renderer sanity check (warn only) — matters here since Play
+    // Store sign-in and the initial "Install" tap need a visible screen. The
+    // real black-screen cause (hw.gpu.enabled=no) is fixed in
+    // applyHardwareConfig(); don't auto-switch to swiftshader, which would
+    // only degrade a working GPU display.
+    const sourceAdb = new Adb(adb.exePath, options.sourceSerial);
+    if (!sourceAdb.rendererHealthy()) {
+      log.warn("Source emulator display renderer check did not pass. If its screen is black/white/grey, confirm hw.gpu.enabled=yes in the source AVD's config.ini, or try --gpu-mode=swiftshader_indirect.");
+    }
+    if (cfg.showWindow) bringEmulatorWindowToFront(options.sourceAvd);
   }
   log.good("Both lab emulator roles are initialized.");
 }

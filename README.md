@@ -54,7 +54,7 @@ Everything else below is either already automated or self-healing on
 | 7-Zip (Windows only) | Auto-installed via `winget install 7zip.7zip` with `--install-sdk`; `.zip` extraction still falls back to the built-in `Expand-Archive` if 7-Zip can't be installed, but `.xz` (frida-server's format) has no fallback and needs it. |
 | Android cmdline-tools / Platform-Tools / Emulator / system images | Downloaded and installed by `sdkmanager` under `--install-sdk`, cached under `tools/cache/`. |
 | Root | Auto-detected per device — see **Root: two kinds, handled automatically** below. Never silently attempts an arbitrary rooting exploit. |
-| Emulator GPU mode | Defaults to `-gpu auto` (safe on VMs like VMware, which usually can't offer real GPU passthrough — this replaced a previous hardcoded `-gpu host` that could show a black emulator window on such machines). A boot timeout also triggers one automatic retry with `-gpu swiftshader_indirect`. Override with `--gpu-mode=<mode>` if needed. |
+| Emulator GPU mode | Defaults to `-gpu swiftshader_indirect` — pure software rendering, no host GPU/driver involved at all. This replaced both a previous hardcoded `-gpu host` (black screen on VMs like VMware) and a later `-gpu auto` default (still produced real host-GPU-driver renderer crashes on some machines even after boot succeeded — `screencap` failing with a solid black/white/grey screen). A renderer-health check plus one automatic retry with `-gpu swiftshader_indirect` also kicks in if you override to a different mode and it fails. Override with `--gpu-mode=<mode>` (e.g. `host` or `auto`) if your machine's GPU passthrough is known to work and you want the speed. |
 
 ### Running fully portable (no system-wide installs at all)
 
@@ -155,7 +155,7 @@ just the SDK the lab already manages):
 $SDK = "$env:LOCALAPPDATA\Android\Sdk"
 & "$SDK\cmdline-tools\latest\bin\sdkmanager.bat" --install "system-images;android-36.1;google_apis_playstore_ps16k;x86_64"
 & "$SDK\cmdline-tools\latest\bin\avdmanager.bat" create avd --name PlayStore_Source --package "system-images;android-36.1;google_apis_playstore_ps16k;x86_64" --device pixel_7_pro --force
-& "$SDK\emulator\emulator.exe" -avd PlayStore_Source -gpu host
+& "$SDK\emulator\emulator.exe" -avd PlayStore_Source -gpu swiftshader_indirect
 ```
 
 Play Store images are intentionally locked down by Google (no `adb root`,
@@ -305,7 +305,7 @@ LAB_PROXY_HOST          Proxy host reachable from the target [Burp by default]
 LAB_PROXY_PORT          Proxy listener port
 LAB_BURP_HOST           Older alias for LAB_PROXY_HOST, still works
 LAB_BURP_PORT           Older alias for LAB_PROXY_PORT, still works
-LAB_GPU_MODE            Emulator -gpu mode [auto]
+LAB_GPU_MODE            Emulator -gpu mode [swiftshader_indirect]
 LAB_PORTABLE            1 = download Java/Python/7-Zip into tools/ only, never the host's own
 ```
 
@@ -426,14 +426,17 @@ if needed. Give it another 30-60s after `sys.boot_completed=1` before
 installing anything — package/activity manager services can still be
 settling right after that property flips.
 
-**Emulator window is black / boot times out on another machine (e.g. a VM)**
+**Emulator window is black/white/grey, or boot times out**
 
-Almost always a GPU-passthrough issue — VMware and similar VMs generally
-can't offer the real OpenGL passthrough `-gpu host` needs. The default is
-now `-gpu auto` (picks host GPU when it actually works, software rendering
-otherwise), and a boot timeout right after launching the emulator also
-triggers one automatic retry with `-gpu swiftshader_indirect`. If it still
-fails, force software rendering directly: `bun run init -- --gpu-mode=swiftshader_indirect`.
+Almost always a host-GPU-driver issue — VMware and similar VMs generally
+can't offer real OpenGL passthrough, and even bare-metal GPU drivers have
+been observed to crash the emulator's renderer after a successful boot
+(`screencap` failing with an assertion error, leaving a solid-color
+screen). The default is `-gpu swiftshader_indirect` (pure software
+rendering, no host GPU touched at all) specifically to avoid this class of
+problem. If you've overridden `--gpu-mode` to `host` or `auto` for speed, a
+boot timeout or a failed post-boot renderer check both trigger one
+automatic retry back to `-gpu swiftshader_indirect` before giving up.
 
 **Need to verify or run the lab without touching the host's own installs**
 

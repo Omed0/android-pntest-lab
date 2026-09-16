@@ -136,17 +136,44 @@ export const DEFAULTS = {
   /** How long (seconds) to wait for the emulator to finish booting. */
   emulatorBootTimeoutSec: 300,
   /**
-   * Emulator `-gpu` mode. "auto" lets the emulator pick host-GPU passthrough
-   * when it actually works and fall back to software rendering (swiftshader)
-   * otherwise — this is the safe default for VMs (VMware, etc.), which
-   * usually can't offer real OpenGL passthrough. Forcing "host" previously
-   * caused an intermittent black emulator window on such machines (the GL
-   * context failed to initialize; a manual retry sometimes worked by luck).
-   * A single automatic retry with "swiftshader_indirect" also kicks in if
-   * the first boot attempt times out — see bootstrapLab()/initializeLab() in
-   * src/lab.ts.
+   * Emulator `-gpu` mode. "auto" lets the emulator pick the best available
+   * backend (host GPU when usable). The earlier "black/white/grey screen"
+   * was NOT actually a `-gpu` mode problem — the real cause was the AVD's
+   * config.ini having hw.gpu.enabled=no (headless `avdmanager create`
+   * default), which forces a broken guest software renderer regardless of
+   * this flag. That's fixed in applyHardwareConfig() (src/avd.ts), which now
+   * writes hw.gpu.enabled=yes + hw.gpu.mode=auto like Android Studio does;
+   * with GPU actually enabled, "auto" renders correctly on the host GPU.
+   * Override with --gpu-mode=<mode> ("host", "swiftshader_indirect", etc.)
+   * if a specific machine needs it. A one-shot boot-timeout fallback to
+   * swiftshader still exists in src/lab.ts for genuinely GPU-less hosts.
    */
   gpuMode:        "auto",
+
+  // ── Emulator window ──────────────────────────────────────────────────────
+  /**
+   * Show the emulator window normally (not hidden) so first-run interaction
+   * (Play Store sign-in, manually using an app to generate traffic) doesn't
+   * require hunting for a hidden window.
+   */
+  showWindow:     true,
+  /**
+   * Pin the emulator window to a fixed position/size and lock the AVD's own
+   * emulator-user.ini read-only, so the emulator can't overwrite it with
+   * whatever position/size it was last closed at (it rewrites this file on
+   * every clean shutdown otherwise). Applied once right after the AVD is
+   * created/found, not on every launch.
+   */
+  lockWindow:     true,
+  windowX:        0,
+  windowY:        0,
+  /**
+   * Window scale. 1.0 = native (a 1440x3120 phone — far too tall for a
+   * 1080p host). 0.3 ≈ 432x936, which stays comfortably on screen while
+   * being large enough to actually tap through an app for traffic capture
+   * (0.2 was a thumbnail, too small to use). Override with --window-scale.
+   */
+  windowScale:    0.3,
 
   // ── Portable mode ─────────────────────────────────────────────────────────
   /**
@@ -191,6 +218,11 @@ export interface LabConfig {
 
   emulatorBootTimeoutSec: number;
   gpuMode: string;
+  showWindow: boolean;
+  lockWindow: boolean;
+  windowX: number;
+  windowY: number;
+  windowScale: number;
 
   // Resolved paths (always absolute)
   toolsDir: string;
@@ -291,6 +323,11 @@ export function loadConfig(labRoot: string, argv = process.argv.slice(2)): LabCo
 
     emulatorBootTimeoutSec: num("boot-timeout", DEFAULTS.emulatorBootTimeoutSec),
     gpuMode: str("gpu-mode", DEFAULTS.gpuMode),
+    showWindow: bool("show-window", DEFAULTS.showWindow),
+    lockWindow: bool("lock-window", DEFAULTS.lockWindow),
+    windowX: num("window-x", DEFAULTS.windowX),
+    windowY: num("window-y", DEFAULTS.windowY),
+    windowScale: num("window-scale", DEFAULTS.windowScale),
 
     toolsDir,
     cacheDir,
@@ -382,7 +419,12 @@ Runtime flags
   --force-avd              Recreate AVD even if it already exists
   --boot-timeout=<sec>     Boot wait timeout [${DEFAULTS.emulatorBootTimeoutSec}s]
   --gpu-mode=<mode>        Emulator -gpu mode [${DEFAULTS.gpuMode}]  LAB_GPU_MODE
-                           Use "swiftshader_indirect" if boots black-screen in a VM.
+                           Default is pure software rendering (no host GPU).
+  --no-show-window         Launch the emulator hidden instead of visible
+  --no-lock-window         Don't pin/lock the emulator window position+size
+  --window-x=<px>          Emulator window X position    [${DEFAULTS.windowX}]  LAB_WINDOW_X
+  --window-y=<px>          Emulator window Y position    [${DEFAULTS.windowY}]  LAB_WINDOW_Y
+  --window-scale=<0-1>     Emulator window scale         [${DEFAULTS.windowScale}]  LAB_WINDOW_SCALE
   --portable               Download Java/Python/7-Zip into tools/ only — never
                            touches the host's own installs or uses winget.
 

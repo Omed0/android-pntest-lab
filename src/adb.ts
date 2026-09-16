@@ -146,6 +146,85 @@ export class Adb {
     throw new Error(`Android did not boot within ${timeoutSec}s.`);
   }
 
+  /**
+   * True if the on-device GPU renderer can actually produce a frame.
+   *
+   * Observed directly on this project's own machine: a fresh AVD can report
+   * `sys.boot_completed=1` (boot genuinely finished) while the display is a
+   * solid white/black/grey screen because the host-GPU-accelerated renderer
+   * crashed — `adb shell screencap` fails with
+   * `Assertion failed: !rcEnc->featureInfo()->hasReadColorBufferDma`. A
+   * boot-timeout retry never catches this since boot itself succeeds; this
+   * check is a separate, explicit renderer sanity check run right after
+   * boot completes.
+   */
+  rendererHealthy(): boolean {
+    const r = this.exec("shell", "screencap", "-p", "/data/local/tmp/.lab-render-check.png");
+    const combined = `${r.stdout}${r.stderr}`;
+    this.exec("shell", "rm", "-f", "/data/local/tmp/.lab-render-check.png");
+    return r.ok && !/Assertion failed|Aborted/i.test(combined);
+  }
+
+  /**
+   * Install a CA certificate into the system trust store WITHOUT needing a
+   * writable /system, dm-verity disable, `-writable-system`, or any reboot.
+   *
+   * Technique (the standard modern one for rooted Android 10+/emulators):
+   * mount a fresh tmpfs over /system/etc/security/cacerts, repopulate it
+   * with the existing system CAs, then add ours — all with just `adb root`.
+   * This sidesteps everything that made the old approach fragile:
+   * `-writable-system` hung this image's boot, and `disable-verity` + reboot
+   * hung the guest. The overlay lasts until the next reboot, which is fine
+   * for a lab session (re-run to reapply).
+   *
+   * @param localDerPath  Local path to the CA in DER form.
+   * @param hash          OpenSSL subject_hash_old of the cert (the on-device
+   *                      filename is `<hash>.0`).
+   * @param push          Callback that pushes a local file to a device path
+   *                      (the caller owns adb push / WSL path translation).
+   * @returns true if the cert is present in the system store afterward.
+   */
+  installSystemCert(
+    localDerPath: string,
+    hash: string,
+    push: (local: string, remote: string) => void,
+  ): boolean {
+    // Ensure adbd is root (needed to mount tmpfs and write into /system).
+    if (!/uid=0/.test(this.shell("id"))) this.exec("root");
+    Bun.sleepSync(500);
+
+    const tmpRemote = "/data/local/tmp/lab-system-ca.der";
+    const destName = `${hash}.0`;
+    push(localDerPath, tmpRemote);
+
+    // If already present from a prior run this session, we're done.
+    const already = this.rootShell(`test -f /system/etc/security/cacerts/${destName} && echo YES || true`).trim();
+    if (already === "YES") {
+      this.rootShell(`rm -f ${tmpRemote}`);
+      return true;
+    }
+
+    // Overlay a tmpfs on the cacerts dir, repopulate with existing certs +
+    // ours, then fix ownership/permissions/SELinux context.
+    const script = [
+      "set -e",
+      "mkdir -p /data/local/tmp/lab-cacerts",
+      "cp /system/etc/security/cacerts/* /data/local/tmp/lab-cacerts/ 2>/dev/null || true",
+      "mount -t tmpfs tmpfs /system/etc/security/cacerts",
+      "cp /data/local/tmp/lab-cacerts/* /system/etc/security/cacerts/ 2>/dev/null || true",
+      `cp ${tmpRemote} /system/etc/security/cacerts/${destName}`,
+      "chown root:root /system/etc/security/cacerts/*",
+      "chmod 644 /system/etc/security/cacerts/*",
+      "chcon u:object_r:system_security_cacerts_file:s0 /system/etc/security/cacerts/* 2>/dev/null || true",
+      `rm -f ${tmpRemote}`,
+      "rm -rf /data/local/tmp/lab-cacerts",
+    ].join("; ");
+    this.rootShell(script);
+
+    const ok = this.rootShell(`test -f /system/etc/security/cacerts/${destName} && echo YES || true`).trim() === "YES";
+    return ok;
+  }
+
   // ── Device info ───────────────────────────────────────────────────────────
 
   getAbi(): string {
