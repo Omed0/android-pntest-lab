@@ -109,6 +109,53 @@ export async function ensureJava(cfg: LabConfig, platform: PlatformInfo): Promis
   );
 }
 
+// ── Android Studio (real, standard install — the opposite of --portable) ──────
+
+/**
+ * Install Android Studio via `winget` as a genuinely standard, discoverable
+ * app — a real Start Menu entry, shows up in Windows search — deliberately
+ * the OPPOSITE of this project's `--portable` pattern for Java/Python/7-Zip,
+ * which is intentionally isolated/hidden. This is purely additive: the
+ * headless, CLI-managed SDK this project actually uses to drive AVDs/the
+ * emulator (ensureSdk() below) is completely independent and unaffected
+ * either way, whether or not Android Studio itself is installed.
+ *
+ * No-op if already installed, if not on Windows, if `--no-android-studio`
+ * was passed, or if `--install-sdk` wasn't set (installing a multi-GB GUI
+ * IDE should never happen silently without that opt-in, same as every other
+ * auto-install in this file).
+ */
+export async function ensureAndroidStudio(cfg: LabConfig): Promise<void> {
+  if (!cfg.androidStudio || process.platform !== "win32") return;
+
+  const installedPath = join(
+    process.env.ProgramFiles ?? "C:\\Program Files",
+    "Android", "Android Studio", "bin", "studio64.exe",
+  );
+  if (existsSync(installedPath)) {
+    log.good("Android Studio already installed.");
+    return;
+  }
+
+  if (!cfg.installSdk) return; // don't nag about a multi-GB IDE without the install opt-in
+
+  if (!run("winget", ["--version"]).ok) {
+    log.warn("winget not found — skipping Android Studio install (--no-android-studio to silence this).");
+    return;
+  }
+
+  log.info("Installing Android Studio via winget (this is a normal, Start-Menu-visible install, not a portable copy)…");
+  const code = await runLive("winget", [
+    "install", "--id", "Google.AndroidStudio", "--exact",
+    "--silent", "--accept-source-agreements", "--accept-package-agreements",
+  ]);
+  if (code === 0 && existsSync(installedPath)) {
+    log.good("Android Studio installed — it will now show up in Windows search / Start Menu.");
+  } else {
+    log.warn("Could not confirm Android Studio installed via winget; continuing without it (the CLI-managed SDK/AVDs are unaffected). Install manually with: winget install Google.AndroidStudio");
+  }
+}
+
 // ── Cmdline-tools download URLs ───────────────────────────────────────────────
 
 const CMDTOOLS_BASE = "https://dl.google.com/android/repository";
@@ -195,6 +242,7 @@ export async function ensureSdk(
   log.step("Android SDK");
   await ensureJava(cfg, platform);
   await ensure7z(cfg, platform);
+  await ensureAndroidStudio(cfg);
 
   const existing = findSdk(cfg, platform);
   if (existing) {
@@ -213,7 +261,7 @@ export async function ensureSdk(
     throw new Error(
       "Android SDK not found.\n\n" +
       "Option A — use an existing installation:\n" +
-      "  bun run bootstrap -- --sdk-root=\"C:\\Users\\you\\AppData\\Local\\Android\\Sdk\"\n\n" +
+      "  bun run init -- --sdk-root=\"C:\\Users\\you\\AppData\\Local\\Android\\Sdk\"\n\n" +
       "Option B — let this script install cmdline-tools automatically:\n" +
       "  bun run init -- --install-sdk\n\n" +
       "Option C — install Android Studio (full IDE):\n" +

@@ -67,7 +67,9 @@ function hookTrustManager() {
     });
 
     var SSLContext = Java.use('javax.net.ssl.SSLContext');
-    var TrustManagerArray = Java.array('Ljavax.net.ssl.TrustManager;', [TrustManager.$new()]);
+    // Java.array() takes a plain type name, not a JNI "Lpkg/Class;" descriptor
+    // (that descriptor form is only for .overload() parameter-type strings).
+    var TrustManagerArray = Java.array('javax.net.ssl.TrustManager', [TrustManager.$new()]);
 
     SSLContext.init.overload(
       '[Ljavax.net.ssl.KeyManager;',

@@ -1,12 +1,12 @@
 // ── Lab configuration — all values with documented defaults ───────────────────
 //
 // Every value can be overridden three ways (highest-priority first):
-//   1. CLI flag:   bun run bootstrap -- --avd-name=MyDevice --avd-ram=8192
-//   2. Env var:    LAB_AVD_NAME=MyDevice LAB_AVD_RAM=8192 bun run bootstrap
+//   1. CLI flag:   bun run init -- --avd-name=MyDevice --avd-ram=8192
+//   2. Env var:    LAB_AVD_NAME=MyDevice LAB_AVD_RAM=8192 bun run init
 //   3. Default:    the values below
 //
 // Role relationships:
-//   LAB_TARGET_SERIAL -> rooted device used by bootstrap, run, verify, and Frida
+//   LAB_TARGET_SERIAL -> rooted device used by init, run, verify, and Frida
 //   LAB_SOURCE_SERIAL -> optional Play Store device used only for APK recovery
 //   LAB_SOURCE_AVD -> AVD name started for LAB_SOURCE_SERIAL
 //   LAB_BURP_HOST/PORT -> one proxy endpoint written to the target device
@@ -17,27 +17,31 @@
 //   $env:LAB_SOURCE_AVD = "Play_Source"
 //   $env:LAB_BURP_HOST = "192.168.50.20"
 //   $env:LAB_BURP_PORT = "8080"
-//   bun run e2e -- --package=com.example.authorized --burp-host=$env:LAB_BURP_HOST --burp-port=$env:LAB_BURP_PORT
+//   bun run init -- --install-sdk
+//   bun run run -- --package=com.example.authorized --burp-host=$env:LAB_BURP_HOST --burp-port=$env:LAB_BURP_PORT
 //
 // Examples
 // ────────
 //   # Minimal — use every default:
-//   bun run init
+//   bun run init -- --install-sdk
 //
 //   # Custom AVD name and more RAM:
-//   bun run bootstrap -- --avd-name=Pixel_8 --avd-ram=8192
+//   bun run init -- --avd-name=Pixel_8 --avd-ram=8192
 //
 //   # Point to a specific SDK root:
-//   bun run bootstrap -- --sdk-root="C:\Users\me\AppData\Local\Android\Sdk"
+//   bun run init -- --sdk-root="C:\Users\me\AppData\Local\Android\Sdk"
 //
 //   # Force reinstall of Frida even if already present:
-//   bun run bootstrap -- --force-frida
+//   bun run init -- --force-frida
 //
 //   # Non-default Burp proxy address (e.g. host machine on LAN):
-//   bun run.ts --package=com.example.app --burp-host=192.168.1.10 --burp-port=8080
+//   bun run run -- --package=com.example.app --burp-host=192.168.1.10 --burp-port=8080
 //
 //   # Attach to a running emulator without starting a new one:
-//   bun run bootstrap -- --skip-emulator
+//   bun run init -- --skip-emulator
+//
+//   # Delete this lab's AVDs + downloaded tools before a from-scratch rebuild:
+//   bun run clean
 //
 // ── Defaults ──────────────────────────────────────────────────────────────────
 
@@ -49,12 +53,22 @@ export const DEFAULTS = {
   targetSerial:   "emulator-5554",
   /** Fallback source serial; override with LAB_SOURCE_SERIAL. */
   sourceSerial:   "emulator-5556",
-  /** Fallback target AVD; override with LAB_AVD_NAME. */
-  targetAvdName:  "Pixel_7_Pro",
   /** Fallback source AVD; override with LAB_SOURCE_AVD. */
   sourceAvdName:  "Pixel_10_Pro",
-  /** Fallback source image; override with LAB_SOURCE_IMAGE_PACKAGE. */
-  sourceImagePackage: "system-images;android-36.1;google_apis_playstore_ps16k;x86_64",
+  /**
+   * Fallback source image; override with LAB_SOURCE_IMAGE_PACKAGE.
+   *
+   * Deliberately NOT a "_ps16k" (16 KB Page Size) variant — that's an
+   * explicitly-labeled "Pre-Release" experimental system image, and is very
+   * likely the actual cause of most of the source-emulator instability seen
+   * this session (DMA-readback assertion crashes on `screencap`, Windows
+   * "device attached to the system is not functioning" GDI layered-window
+   * failures, and boot timeouts under `-gpu auto` even with GPU enabled) —
+   * none of that is expected from a normal, non-experimental Play Store
+   * image. android-37.0's plain `google_apis_playstore` (no ps16k suffix)
+   * is the newest STABLE Play Store image available as of this writing.
+   */
+  sourceImagePackage: "system-images;android-37.0;google_apis_playstore;x86_64",
   /**
    * Preferred device profile for the source AVD; override with
    * LAB_SOURCE_DEVICE_PROFILE. This is a *preference*, not a hard
@@ -131,17 +145,33 @@ export const DEFAULTS = {
    */
   burpHost:       "10.0.2.2",
   burpPort:       8080,
+  /**
+   * When true (default), every `bun run init` also sets the target's global
+   * HTTP/HTTPS proxy to burpHost:burpPort and installs the proxy's CA into
+   * the system trust store — so the lab is proxy-ready as soon as init
+   * finishes, without waiting for the first `bun run.ts` (which re-applies
+   * the same idempotent steps anyway, e.g. after a device restart). Disable
+   * with --no-proxy if you don't want any proxy touched during init.
+   */
+  proxyEnabled:   true,
+  /**
+   * "burp" auto-downloads the CA from Burp's built-in http://burp/cert
+   * endpoint through the configured proxy. "other" skips that (a non-Burp
+   * tool won't answer there) and expects a CA file under cert/ or
+   * --proxy-cert=<path> instead.
+   */
+  proxyTool:      "burp" as "burp" | "other",
 
   // ── Runtime ───────────────────────────────────────────────────────────────
   /** How long (seconds) to wait for the emulator to finish booting. */
   emulatorBootTimeoutSec: 300,
   /**
-   * Emulator `-gpu` mode. "auto" lets the emulator pick the best available
-   * backend (host GPU when usable). The earlier "black/white/grey screen"
-   * was NOT actually a `-gpu` mode problem — the real cause was the AVD's
-   * config.ini having hw.gpu.enabled=no (headless `avdmanager create`
+   * TARGET emulator `-gpu` mode. "auto" lets the emulator pick the best
+   * available backend (host GPU when usable). The earlier "black/white/grey
+   * screen" was NOT actually a `-gpu` mode problem — the real cause was the
+   * AVD's config.ini having hw.gpu.enabled=no (headless `avdmanager create`
    * default), which forces a broken guest software renderer regardless of
-   * this flag. That's fixed in applyHardwareConfig() (src/avd.ts), which now
+   * this flag. That's fixed in applyGpuConfig() (src/avd.ts), which now
    * writes hw.gpu.enabled=yes + hw.gpu.mode=auto like Android Studio does;
    * with GPU actually enabled, "auto" renders correctly on the host GPU.
    * Override with --gpu-mode=<mode> ("host", "swiftshader_indirect", etc.)
@@ -149,6 +179,20 @@ export const DEFAULTS = {
    * swiftshader still exists in src/lab.ts for genuinely GPU-less hosts.
    */
   gpuMode:        "auto",
+  /**
+   * SOURCE (Play Store) emulator retry-only `-gpu` mode. NOT passed on the
+   * source's normal launch — confirmed directly that launching the source
+   * AVD exactly like Android Studio's own Device Manager does (no explicit
+   * `-gpu` CLI override at all, letting hw.gpu.mode=auto from config.ini be
+   * the only GPU setting in effect) renders correctly, while this project's
+   * own earlier custom `-gpu auto` CLI override on the same AVD produced
+   * real instability (DMA-readback assertion crashes on `screencap`,
+   * Windows "device attached to the system is not functioning" GDI
+   * layered-window failures, and boot timeouts). This value is used ONLY as
+   * a one-shot forced override if the source's normal (flagless) launch
+   * times out — see initializeLab() in src/lab.ts.
+   */
+  sourceGpuMode:  "swiftshader_indirect",
 
   // ── Emulator window ──────────────────────────────────────────────────────
   /**
@@ -162,18 +206,24 @@ export const DEFAULTS = {
    * emulator-user.ini read-only, so the emulator can't overwrite it with
    * whatever position/size it was last closed at (it rewrites this file on
    * every clean shutdown otherwise). Applied once right after the AVD is
-   * created/found, not on every launch.
+   * created/found, not on every launch. Applied to the TARGET only — the
+   * source AVD is deliberately left unlocked/unsized (see sourceGpuMode's
+   * comment above: matching Android Studio's own flagless launch is what
+   * actually renders correctly for the source).
    */
   lockWindow:     true,
   windowX:        0,
   windowY:        0,
   /**
-   * Window scale. 1.0 = native (a 1440x3120 phone — far too tall for a
-   * 1080p host). 0.3 ≈ 432x936, which stays comfortably on screen while
-   * being large enough to actually tap through an app for traffic capture
-   * (0.2 was a thumbnail, too small to use). Override with --window-scale.
+   * Window scale. 0 (default) = auto-fit: lockEmulatorWindow() (src/avd.ts)
+   * computes the largest scale that fits the device's full height within
+   * ~92% of THIS machine's actual screen work area — a fixed guess like 0.3
+   * is wrong on a small/remote display (confirmed: 0.3 already overflowed a
+   * 1280x752 work area here) and leaves free space unused on a large one.
+   * Pass an explicit --window-scale=<n> (0 < n <= 1.0; 1.0 = native size) to
+   * override with a literal scale instead.
    */
-  windowScale:    0.3,
+  windowScale:    0,
 
   // ── Portable mode ─────────────────────────────────────────────────────────
   /**
@@ -186,6 +236,29 @@ export const DEFAULTS = {
    * touching anything outside its own directory tree.
    */
   portable:       false,
+
+  // ── Android Studio (optional GUI) ────────────────────────────────────────
+  /**
+   * When true and --install-sdk is passed, also installs Android Studio for
+   * real via `winget install --id Google.AndroidStudio` — a normal, visible
+   * Start Menu / Windows Search install, deliberately the OPPOSITE of the
+   * hidden `portable` pattern above. Purely additive: the CLI-managed
+   * SDK/AVDs this lab actually drives are unaffected either way. Skip with
+   * --no-android-studio.
+   */
+  androidStudio:  true,
+
+  // ── Root ──────────────────────────────────────────────────────────────────
+  /**
+   * When true, after the target boots, download rootAVD
+   * (https://github.com/newbit1/rootAVD) and patch the target's ramdisk
+   * with real Magisk (not just `adb root`) — some apps detect root via the
+   * `su`/Magisk app specifically, not the adbd root mode this lab already
+   * uses by default. Off by default because it modifies the AVD image and
+   * takes an extra boot cycle; pass --magisk-root to enable it. See
+   * src/magisk.ts (ensureMagiskRoot) for the implementation.
+   */
+  magiskRoot:     false,
 } as const;
 
 // ── LabConfig interface ───────────────────────────────────────────────────────
@@ -215,9 +288,12 @@ export interface LabConfig {
 
   burpHost: string;
   burpPort: number;
+  proxyEnabled: boolean;
+  proxyTool: "burp" | "other";
 
   emulatorBootTimeoutSec: number;
   gpuMode: string;
+  sourceGpuMode: string;
   showWindow: boolean;
   lockWindow: boolean;
   windowX: number;
@@ -235,6 +311,8 @@ export interface LabConfig {
   forceAvd:     boolean;
   skipEmulator: boolean;
   portable:     boolean;
+  androidStudio: boolean;
+  magiskRoot:   boolean;
 }
 
 // ── loadConfig ────────────────────────────────────────────────────────────────
@@ -320,9 +398,12 @@ export function loadConfig(labRoot: string, argv = process.argv.slice(2)): LabCo
 
     burpHost: strAlias(["proxy-host", "burp-host"], DEFAULTS.burpHost),
     burpPort: numAlias(["proxy-port", "burp-port"], DEFAULTS.burpPort),
+    proxyEnabled: bool("proxy", DEFAULTS.proxyEnabled) && bool("burp", DEFAULTS.proxyEnabled),
+    proxyTool: (strAlias(["proxy-tool"], DEFAULTS.proxyTool) === "other" ? "other" : "burp"),
 
     emulatorBootTimeoutSec: num("boot-timeout", DEFAULTS.emulatorBootTimeoutSec),
     gpuMode: str("gpu-mode", DEFAULTS.gpuMode),
+    sourceGpuMode: str("source-gpu-mode", DEFAULTS.sourceGpuMode),
     showWindow: bool("show-window", DEFAULTS.showWindow),
     lockWindow: bool("lock-window", DEFAULTS.lockWindow),
     windowX: num("window-x", DEFAULTS.windowX),
@@ -338,6 +419,8 @@ export function loadConfig(labRoot: string, argv = process.argv.slice(2)): LabCo
     forceAvd:     bool("force-avd"),
     skipEmulator: bool("skip-emulator"),
     portable,
+    androidStudio: bool("android-studio", DEFAULTS.androidStudio),
+    magiskRoot:    bool("magisk-root", DEFAULTS.magiskRoot),
   };
 }
 
@@ -376,12 +459,13 @@ function toEnvKey(key: string): string {
 
 function printHelp(): void {
   console.log(`
-Android Pentest Lab — Bun/TypeScript cross-platform bootstrap
-  Works on: Windows 11 · WSL2 · Linux
+Android Pentest Lab — Bun/TypeScript automation
+  Primary target: Windows 11
 
 Usage
-  bun run bootstrap -- [options] # set up the rooted lab
-  bun run.ts       [options]     # attach Frida to a target app
+  bun run init -- [options]      # set up the rooted lab (AVD, SDK, Frida)
+  bun run run  -- [options]      # attach Frida to a target app
+  bun run clean                  # delete this lab's AVDs + downloaded tools
   bun verify.ts                  # quick connectivity check
 
 AVD options (default → env var → flag)
@@ -403,6 +487,14 @@ SDK options
   --sdk-root=<path>        Android SDK root  [auto-detect]     LAB_SDK_ROOT
   --install-sdk            Download+install cmdline-tools if SDK not found
   --cmdline-tools-version  SDK build number  [${DEFAULTS.cmdlineToolsVersion}]
+  --no-android-studio      With --install-sdk, skip installing the Android
+                           Studio GUI (winget). On by default; purely
+                           additive to the CLI-managed SDK this lab uses.
+
+Root options
+  --magisk-root            Patch the target's ramdisk with real Magisk via
+                           rootAVD after first boot (su/Magisk-specific
+                           detection, not just adb-root). Off by default.
 
 Frida options
   --frida-version=<ver>    Pin frida version ["auto" = match host]  LAB_FRIDA_VERSION
@@ -413,13 +505,25 @@ Proxy options (Burp Suite by default — any other proxy tool also works)
   --proxy-host=<ip>        Proxy host        [${DEFAULTS.burpHost}]  LAB_PROXY_HOST
   --proxy-port=<n>         Proxy port        [${DEFAULTS.burpPort}]        LAB_PROXY_PORT
   --burp-host / --burp-port   Older names, still work as aliases for the above.
+  --proxy-tool=<burp|other> Whether to auto-fetch the CA from http://burp/cert [${DEFAULTS.proxyTool}]
+                           "other" skips that and expects a CA under cert/ or --proxy-cert=<path>.
+  --no-proxy               Skip setting the device proxy + installing the CA
+                           during "bun run init" entirely (alias: --no-burp).
+                           "bun run run" still does its own proxy setup
+                           unless it's also passed --no-proxy there.
 
 Runtime flags
   --skip-emulator          Skip starting the emulator (already running)
   --force-avd              Recreate AVD even if it already exists
   --boot-timeout=<sec>     Boot wait timeout [${DEFAULTS.emulatorBootTimeoutSec}s]
-  --gpu-mode=<mode>        Emulator -gpu mode [${DEFAULTS.gpuMode}]  LAB_GPU_MODE
-                           Default is pure software rendering (no host GPU).
+  --gpu-mode=<mode>        Target emulator -gpu mode [${DEFAULTS.gpuMode}]  LAB_GPU_MODE
+                           Host GPU when usable; hw.gpu.enabled=yes is
+                           written to the AVD's config.ini so this works.
+  --source-gpu-mode=<mode> Source emulator retry-only -gpu mode
+                           [${DEFAULTS.sourceGpuMode}]  LAB_SOURCE_GPU_MODE
+                           Not used on the source's normal launch (matches
+                           Android Studio's own flagless Device Manager
+                           launch) — only forced if that launch times out.
   --no-show-window         Launch the emulator hidden instead of visible
   --no-lock-window         Don't pin/lock the emulator window position+size
   --window-x=<px>          Emulator window X position    [${DEFAULTS.windowX}]  LAB_WINDOW_X

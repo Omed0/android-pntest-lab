@@ -55,10 +55,8 @@ function apkanalyzerPath(sdkRoot: string, platform: PlatformInfo): string {
 // ── Extraction ──────────────────────────────────────────────────────────────
 
 function fromAapt(aapt: string, apk: string): ApkInfo | null {
-  // aapt2 uses "dump badging <apk>"; classic aapt uses "dump badging <apk>" too.
-  const isAapt2 = /aapt2(\.exe)?$/i.test(aapt);
-  const args = isAapt2 ? ["dump", "badging", apk] : ["dump", "badging", apk];
-  const r = run(aapt, args);
+  // Both aapt2 and classic aapt accept identical "dump badging <apk>" args.
+  const r = run(aapt, ["dump", "badging", apk]);
   if (!r.ok || !r.stdout.includes("package:")) return null;
   const out = r.stdout;
   const pkg = out.match(/package:\s*name='([^']+)'/)?.[1];
@@ -107,7 +105,7 @@ Usage
   bun run apkinfo -- <path>
   bun run apkinfo -- --apk=<path> --quiet   # only the package name (for scripting)
 
-Then feed the package name to transfer/run/e2e, e.g.:
+Then feed the package name to run/transfer, e.g.:
   bun run transfer -- --package=<name>
 `);
 }
@@ -133,7 +131,7 @@ async function main(): Promise<void> {
     fail(
       "Could not read the package name.\n" +
       "  Need either build-tools (aapt/aapt2) or cmdline-tools (apkanalyzer) in the SDK.\n" +
-      "  Install with: bun run bootstrap -- --install-sdk",
+      "  Install with: bun run init -- --install-sdk",
     );
   }
 
@@ -148,7 +146,7 @@ async function main(): Promise<void> {
   if (info!.launchActivity) log.info(`Activity: ${info!.launchActivity}`);
   console.log("");
   log.info(`Next:  bun run transfer -- --package=${info!.packageName}`);
-  log.info(`  or:  bun run e2e -- --package=${info!.packageName} --apk=${apk}`);
+  log.info(`  or:  bun run run -- --package=${info!.packageName} --apk=${apk}`);
 }
 
 main().catch(err => {

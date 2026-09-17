@@ -365,7 +365,22 @@ export async function deployFridaServer(
   // ── Smoke-test the binary ─────────────────────────────────────────────────
 
   log.info("Testing frida-server binary on device…");
-  const deviceVersion = adb.rootShell(`${remote} --version`);
+  // A binary that's just been pushed+chmod'd on a device that was JUST
+  // rooted/booted (the from-scratch case: clean -> init) can transiently
+  // produce empty output on the very first exec attempt — observed
+  // directly right after a fresh AVD's `adb root` grant, even though the
+  // file existence/executable-bit sanity check above already passed.
+  // Retry a few times with a short backoff before treating it as a real
+  // version mismatch/corrupt binary.
+  let deviceVersion = "";
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    deviceVersion = adb.rootShell(`${remote} --version`);
+    if (deviceVersion.includes(version)) break;
+    if (attempt < 4) {
+      log.warn(`frida-server --version gave no/unexpected output (attempt ${attempt}/4) — retrying…`);
+      Bun.sleepSync(1_500);
+    }
+  }
   if (!deviceVersion.includes(version)) {
     throw new Error(
       `Device binary version mismatch.\n` +

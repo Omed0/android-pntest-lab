@@ -66,17 +66,21 @@ Options
 /**
  * Under real load (two emulators booting/running at once, which is exactly
  * this project's normal source+target setup) the system server can
- * transiently answer "Can't find service: <x>" or drop the binder
- * connection ("Broken pipe") for a moment right after boot or right after
+ * transiently answer "Can't find service: <x>", drop the binder connection
+ * ("Broken pipe"), or refuse to start an activity ("Too early to start
+ * activity" — ActivityManager not fully settled right after
+ * sys.boot_completed=1 flips) for a moment right after boot or right after
  * an install/uninstall — observed directly, repeatedly, on this project's
- * own emulator pair. It always recovers within a few seconds. Retry a
- * couple of times on that specific class of error instead of hard-failing
- * the whole transfer on a hiccup that would have gone away on its own.
+ * own emulator pair. It always recovers within a handful of seconds. Retry
+ * on that specific class of transient error instead of hard-failing the
+ * whole transfer on a hiccup that would have gone away on its own.
  */
+const TRANSIENT_ERROR = /Can't find service|Broken pipe|Too early to start activity/i;
+
 function adb(adbPath: string, serial: string, ...args: string[]) {
   let r = run(adbPath, ["-s", serial, ...args]);
-  for (let i = 0; !r.ok && /Can't find service|Broken pipe/i.test(r.stderr) && i < 3; i++) {
-    Bun.sleepSync(2_000);
+  for (let i = 0; !r.ok && TRANSIENT_ERROR.test(r.stderr + r.stdout) && i < 5; i++) {
+    Bun.sleepSync(3_000);
     r = run(adbPath, ["-s", serial, ...args]);
   }
   return r;
@@ -136,7 +140,11 @@ function pullApk(adbPath: string, serial: string, remotePath: string, localPath:
 }
 
 function installApks(adbPath: string, serial: string, paths: string[]): void {
-  const result = run(adbPath, ["-s", serial, "install-multiple", "-r", "-t", ...paths]);
+  // Route through the retry-wrapped adb() helper, not a bare run() — this is
+  // exactly the kind of call that can race a freshly-booted target's
+  // ActivityManager/PackageManager, the same class of transient error the
+  // TRANSIENT_ERROR retry above exists for.
+  const result = adb(adbPath, serial, "install-multiple", "-r", "-t", ...paths);
   if (!result.ok) throw new Error(`Target installation failed:\n${result.stderr.trim() || result.stdout.trim()}`);
 }
 

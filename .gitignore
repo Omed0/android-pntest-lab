@@ -1,5 +1,7 @@
 node_modules/
 bun.lock
+.env
+.env.*
 
 # Downloaded frida binaries (large)
 tools/frida/
@@ -20,3 +22,5 @@ cert/*.pem
 # Disposable verification workspaces (may contain extracted/pulled APK
 # content — never committed, see README "Safety")
 testing/
+
+.claude/

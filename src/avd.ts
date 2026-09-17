@@ -119,6 +119,10 @@ export async function ensureAvd(
   if (avdExists(cfg.avdName, emuPath)) {
     if (!cfg.forceAvd) {
       log.good(`AVD already exists: ${cfg.avdName}`);
+      // Reapply unconditionally, same as the source AVD in lab.ts — an AVD
+      // created before this GPU fix existed (or with GPU otherwise disabled)
+      // would otherwise never get hw.gpu.enabled=yes just by being reused.
+      applyGpuConfig(cfg.avdName);
       lockEmulatorWindow(cfg, cfg.avdName, platform);
       return;
     }
@@ -208,22 +212,31 @@ function applyHardwareConfig(cfg: LabConfig): void {
 
 /**
  * Enable GPU emulation on an AVD's config.ini (hw.gpu.enabled=yes,
- * hw.gpu.mode=auto).
+ * hw.gpu.mode=auto), and enable host-keyboard passthrough (hw.keyboard=yes).
  *
- * This MUST be set or the emulator falls back to a broken guest software
- * renderer that shows a solid black/white/grey screen (and boots much
- * slower, often past the boot timeout) — the actual root cause of both the
- * "black screen" and the "source AVD times out" problems on this project's
- * machine. `avdmanager create avd` (headless) defaults hw.gpu.enabled=no,
- * unlike Android Studio's AVD wizard which writes yes/auto. Applying this to
- * *every* AVD the lab uses (target AND the Play Store source) makes them
- * render on the host GPU and boot in seconds. Safe to call repeatedly and on
- * an already-existing AVD.
+ * GPU: this MUST be set or the emulator falls back to a broken guest
+ * software renderer that shows a solid black/white/grey screen (and boots
+ * much slower, often past the boot timeout) — the actual root cause of both
+ * the "black screen" and the "source AVD times out" problems on this
+ * project's machine. `avdmanager create avd` (headless) defaults
+ * hw.gpu.enabled=no, unlike Android Studio's AVD wizard which writes
+ * yes/auto.
+ *
+ * Keyboard: `avdmanager create avd` (headless) also defaults
+ * hw.keyboard=no for phone profiles — with that set, Android treats no
+ * physical keyboard as present and only accepts input via the on-screen
+ * soft keyboard, so the host's own keyboard does nothing when typing into a
+ * focused field. Setting hw.keyboard=yes makes the emulator forward host
+ * keystrokes as real hardware key events, which is what a lab actually
+ * needs (typing search queries, Play Store sign-in, app text fields).
+ *
+ * Applying both to *every* AVD the lab uses (target AND the Play Store
+ * source) is safe to call repeatedly and on an already-existing AVD.
  */
 export function applyGpuConfig(avdName: string): void {
   const configFile = join(avdHomeDir(avdName), "config.ini");
   if (!existsSync(configFile)) {
-    log.warn(`config.ini not found for ${avdName} — cannot enable GPU (${configFile}).`);
+    log.warn(`config.ini not found for ${avdName} — cannot apply GPU/keyboard config (${configFile}).`);
     return;
   }
   let ini = readFileSync(configFile, "utf8");
@@ -233,8 +246,55 @@ export function applyGpuConfig(avdName: string): void {
   };
   setKey("hw.gpu.enabled", "yes");
   setKey("hw.gpu.mode",    "auto");
+  setKey("hw.keyboard",    "yes");
   writeFileSync(configFile, ini, "utf8");
-  log.good(`GPU enabled for AVD: ${avdName}`);
+  log.good(`GPU + host keyboard enabled for AVD: ${avdName}`);
+}
+
+/**
+ * The emulator's window enforces `window.scale` as a hard max size, not just
+ * an initial size — confirmed directly: Win32 `ShowWindow(SW_SHOWMAXIMIZED)`
+ * on this window has NO effect at all (size and placement state unchanged)
+ * when a scale is locked, because the app itself refuses to grow past it.
+ * So "bring it up maximized" has to mean "lock a scale that actually fills
+ * the real screen", not an OS-level maximize call — and it has to be
+ * measured on THIS machine every time, never a guessed constant (confirmed:
+ * a fixed 0.3 already overflowed a real 1280x752 work area seen on this
+ * project's own machine, and a fixed fallback would be just as wrong on a
+ * different one).
+ *
+ * Two independent, purely dynamic measurements, tried in order:
+ *   1. .NET `Screen.PrimaryScreen.WorkingArea` — excludes the taskbar, the
+ *      more accurate figure when available.
+ *   2. Raw Win32 `GetSystemMetrics(SM_CXSCREEN=0, SM_CYSCREEN=1)` — the full
+ *      screen resolution (no taskbar exclusion), available on effectively
+ *      any Windows session with a display even where System.Windows.Forms
+ *      can't load. Still a real, live measurement, not a guess.
+ * Returns null (never a hardcoded number) if BOTH genuinely fail.
+ */
+function windowsWorkArea(): { width: number; height: number } | null {
+  if (process.platform !== "win32") return null;
+
+  const viaForms = run("powershell", [
+    "-NoProfile", "-Command",
+    "Add-Type -AssemblyName System.Windows.Forms; " +
+    "$a = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea; \"$($a.Width)x$($a.Height)\"",
+  ]);
+  let m = viaForms.stdout.trim().match(/^(\d+)x(\d+)$/);
+  if (viaForms.ok && m) return { width: parseInt(m[1], 10), height: parseInt(m[2], 10) };
+
+  const viaGdi = run("powershell", [
+    "-NoProfile", "-Command",
+    `Add-Type @"
+using System.Runtime.InteropServices;
+public class LabMetrics { [DllImport("user32.dll")] public static extern int GetSystemMetrics(int n); }
+"@
+"$([LabMetrics]::GetSystemMetrics(0))x$([LabMetrics]::GetSystemMetrics(1))"`,
+  ]);
+  m = viaGdi.stdout.trim().match(/^(\d+)x(\d+)$/);
+  if (viaGdi.ok && m) return { width: parseInt(m[1], 10), height: parseInt(m[2], 10) };
+
+  return null;
 }
 
 /**
@@ -244,6 +304,17 @@ export function applyGpuConfig(avdName: string): void {
  * Safe to call every run: strips read-only, rewrites the same values,
  * re-locks — a no-op in effect once already applied. No-op entirely if
  * `cfg.lockWindow` is false.
+ *
+ * `cfg.windowScale <= 0` (the default) means "auto-fit": measure THIS
+ * machine's actual screen (see windowsWorkArea()) and the AVD's own real
+ * device resolution (hw.lcd.width/height from its config.ini — never
+ * assumed), then compute the largest scale that fits the device's full
+ * width AND height within ~92% of the screen, capped at native size
+ * (1.0). If either real measurement is unavailable, `window.scale` is left
+ * unset entirely (the emulator's own default) instead of substituting a
+ * guessed number — this must reflect the actual screen and actual device,
+ * not a static human-picked constant. Pass an explicit
+ * --window-scale=<n> (n > 0) to override with a literal scale instead.
  */
 export function lockEmulatorWindow(cfg: LabConfig, avdName: string, platform: PlatformInfo): void {
   if (!cfg.lockWindow) return;
@@ -252,6 +323,25 @@ export function lockEmulatorWindow(cfg: LabConfig, avdName: string, platform: Pl
   const iniPath = join(avdHome, "emulator-user.ini");
 
   if (!existsSync(avdHome)) return; // AVD doesn't exist yet — nothing to lock
+
+  let scale: number | null = cfg.windowScale > 0 ? cfg.windowScale : null;
+  let autoFit = false;
+  if (scale === null) {
+    const configPath = join(avdHome, "config.ini");
+    const workArea = windowsWorkArea();
+    const configIni = existsSync(configPath) ? readFileSync(configPath, "utf8") : "";
+    const lcdHeight = parseInt(configIni.match(/^hw\.lcd\.height\s*=\s*(\d+)/m)?.[1] ?? "", 10);
+    const lcdWidth = parseInt(configIni.match(/^hw\.lcd\.width\s*=\s*(\d+)/m)?.[1] ?? "", 10);
+    if (workArea && !isNaN(lcdHeight) && lcdHeight > 0 && !isNaN(lcdWidth) && lcdWidth > 0) {
+      const margin = 0.92;
+      const byHeight = (workArea.height * margin) / lcdHeight;
+      const byWidth = (workArea.width * margin) / lcdWidth;
+      scale = Math.min(1.0, byHeight, byWidth);
+      autoFit = true;
+    } else {
+      log.warn(`Could not measure screen/device size for ${avdName} — leaving window.scale unset (emulator default) instead of guessing.`);
+    }
+  }
 
   if (platform.type === "windows") run("attrib", ["-R", iniPath]);
   else run("chmod", ["644", iniPath]);
@@ -267,7 +357,7 @@ export function lockEmulatorWindow(cfg: LabConfig, avdName: string, platform: Pl
   const lines = [
     `window.x = ${cfg.windowX}`,
     `window.y = ${cfg.windowY}`,
-    `window.scale = ${cfg.windowScale.toFixed(6)}`,
+    ...(scale !== null ? [`window.scale = ${scale.toFixed(6)}`] : []),
     "resizable.config.id = -1",
     "posture = 0",
   ];
@@ -278,7 +368,11 @@ export function lockEmulatorWindow(cfg: LabConfig, avdName: string, platform: Pl
   if (platform.type === "windows") run("attrib", ["+R", iniPath]);
   else run("chmod", ["444", iniPath]);
 
-  log.good(`Emulator window locked: x=${cfg.windowX} y=${cfg.windowY} scale=${cfg.windowScale}`);
+  log.good(
+    scale !== null
+      ? `Emulator window locked: x=${cfg.windowX} y=${cfg.windowY} scale=${scale.toFixed(3)}${autoFit ? " (measured, auto-fit)" : ""}`
+      : `Emulator window position locked: x=${cfg.windowX} y=${cfg.windowY} (scale left to the emulator's own default)`,
+  );
 }
 
 // ── Emulator launch ───────────────────────────────────────────────────────────
@@ -413,17 +507,26 @@ export function killEmulator(adbPath: string, serial: string): void {
  * afterward to bury it again. Best-effort; no-op on non-Windows or when the
  * window isn't found. Not left permanently topmost so the user can still
  * click over to Burp/other tools.
+ *
+ * @param maximize  When true, issue SW_SHOWMAXIMIZED instead of SW_RESTORE.
+ *   For the TARGET, lockEmulatorWindow() already pins an explicit
+ *   window.scale in emulator-user.ini, which enforces a fixed max size on
+ *   the Qt window — confirmed directly that SW_SHOWMAXIMIZED is silently
+ *   ignored in that case, so SW_RESTORE (un-minimize) + raise is all that's
+ *   used there. The SOURCE AVD deliberately has no window.scale/lock applied
+ *   at all (see src/lab.ts initializeLab()), so there's no such constraint —
+ *   a real OS-level maximize works and is what's used to size its window
+ *   instead of any custom scale math.
  */
-export function bringEmulatorWindowToFront(avdName: string): void {
+export function bringEmulatorWindowToFront(avdName: string, maximize = false): void {
   if (process.platform !== "win32") return;
-  // The emulator's Qt window enforces a max size (phone aspect ratio), so
-  // SW_SHOWMAXIMIZED is silently ignored — the reliable action is SW_RESTORE
-  // (un-minimize) + raise to foreground. Target the window BY AVD NAME (its
-  // title is "Android Emulator - <avd>:<port>"), not just the first qemu
-  // window, so with two emulators up we raise the right one. AttachThreadInput
-  // to the current foreground thread is what lets SetForegroundWindow take
-  // from a background (bun/powershell) process. Retry a few times since the
-  // window handle can lag right after boot.
+  const showCmd = maximize ? 3 : 9; // SW_SHOWMAXIMIZED : SW_RESTORE
+  // Target the window BY AVD NAME (its title is "Android Emulator -
+  // <avd>:<port>"), not just the first qemu window, so with two emulators up
+  // we raise the right one. AttachThreadInput to the current foreground
+  // thread is what lets SetForegroundWindow take from a background
+  // (bun/powershell) process. Retry a few times since the window handle can
+  // lag right after boot.
   const ps = `
 $ErrorActionPreference='SilentlyContinue'
 Add-Type @"
@@ -448,7 +551,7 @@ for ($i=0; $i -lt 8 -and -not $raised; $i++) {
     $ct = [LabWin]::GetCurrentThreadId()
     $ft = [LabWin]::GetWindowThreadProcessId($fg, [IntPtr]::Zero)
     [LabWin]::AttachThreadInput($ft, $ct, $true) | Out-Null
-    [LabWin]::ShowWindow($h, 9) | Out-Null   # SW_RESTORE (un-minimize)
+    [LabWin]::ShowWindow($h, ${showCmd}) | Out-Null   # ${maximize ? "SW_SHOWMAXIMIZED" : "SW_RESTORE (un-minimize)"}
     [LabWin]::BringWindowToTop($h) | Out-Null
     [LabWin]::SetForegroundWindow($h) | Out-Null
     [LabWin]::AttachThreadInput($ft, $ct, $false) | Out-Null

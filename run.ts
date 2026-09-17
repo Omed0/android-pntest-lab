@@ -20,13 +20,13 @@
 //
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { copyFileSync, existsSync, mkdirSync, readdirSync, statSync } from "fs";
-import { join } from "path";
+import { existsSync } from "fs";
 import { log, fail } from "./src/log.ts";
 import { detectPlatform } from "./src/platform.ts";
 import { DEFAULTS, loadConfig, printConfig } from "./src/config.ts";
 import { findAdb } from "./src/adb.ts";
 import { bringEmulatorWindowToFront } from "./src/avd.ts";
+import { setDeviceProxy, ensureProxyCertificate } from "./src/proxy.ts";
 import {
   activatePortablePython,
   getHostFridaVersion,
@@ -47,16 +47,16 @@ interface RunOptions {
   burpCert?: string;
   burp: boolean;
   proxyTool: "burp" | "other";
-  spawnMode: boolean;     // --spawn: use frida --spawn instead of attaching
+  spawnMode: boolean; // --spawn: use frida --spawn instead of attaching
   verbose: boolean;
 }
 
 function parseRunArgs(argv: string[]): RunOptions {
   const opts: RunOptions = {
-    burp:       true,
-    proxyTool:  "burp",
-    spawnMode:  false,
-    verbose:    false,
+    burp: true,
+    proxyTool: "burp",
+    spawnMode: false,
+    verbose: false,
     sourceSerial: process.env.LAB_SOURCE_SERIAL ?? DEFAULTS.sourceSerial,
   };
 
@@ -69,19 +69,39 @@ function parseRunArgs(argv: string[]): RunOptions {
     if (!m) continue;
     const [, key, val] = m;
     switch (key) {
-      case "package":        opts.package      = val; break;
-      case "apk":            opts.apk          = val; break;
-      case "main-activity":  opts.mainActivity = val; break;
-      case "frida-script":   opts.fridaScript  = val; break;
-      case "source-serial":  opts.sourceSerial = val ?? opts.sourceSerial; break;
+      case "package":
+        opts.package = val;
+        break;
+      case "apk":
+        opts.apk = val;
+        break;
+      case "main-activity":
+        opts.mainActivity = val;
+        break;
+      case "frida-script":
+        opts.fridaScript = val;
+        break;
+      case "source-serial":
+        opts.sourceSerial = val ?? opts.sourceSerial;
+        break;
       case "burp-cert":
-      case "proxy-cert":     opts.burpCert     = val; break;
+      case "proxy-cert":
+        opts.burpCert = val;
+        break;
       case "no-burp":
-      case "no-proxy":       opts.burp         = false; break;
-      case "proxy-tool":     opts.proxyTool    = val === "other" ? "other" : "burp"; break;
-      case "spawn":          opts.spawnMode    = true; break;
+      case "no-proxy":
+        opts.burp = false;
+        break;
+      case "proxy-tool":
+        opts.proxyTool = val === "other" ? "other" : "burp";
+        break;
+      case "spawn":
+        opts.spawnMode = true;
+        break;
       case "verbose":
-      case "v":              opts.verbose       = true; break;
+      case "v":
+        opts.verbose = true;
+        break;
     }
   }
   return opts;
@@ -118,7 +138,7 @@ function printRunHelp(): void {
 
 \x1b[1mAll bootstrap options also apply\x1b[0m (passed through to config):
   --avd-name, --sdk-root, --frida-version, --proxy-host, --proxy-port, ...
-  Run \`bun run bootstrap -- --help\` for the full list.
+  Run \`bun run init -- --help\` for the full list.
 
 \x1b[1mExamples\x1b[0m
   # Attach to an already-running app (Burp is the default proxy)
@@ -138,32 +158,6 @@ function printRunHelp(): void {
 `);
 }
 
-// ── Burp proxy helpers ────────────────────────────────────────────────────────
-
-/**
- * Configure the emulator's global HTTP/HTTPS proxy to point at the
- * configured listener (Burp by default; any proxy tool works the same way).
- * Uses `adb shell settings put global http_proxy host:port`.
- * The emulator's default gateway 10.0.2.2 reaches the host machine.
- */
-function setBurpProxy(adb: ReturnType<typeof findAdb>, host: string, port: number, proxyTool: "burp" | "other"): void {
-  log.step("Proxy");
-  log.info(`Setting device proxy → ${host}:${port}`);
-  adb.shell(`settings put global http_proxy ${host}:${port}`);
-  const val = adb.shell("settings get global http_proxy");
-  if (val.includes(`${host}:${port}`)) {
-    log.good(`Proxy set: ${host}:${port}`);
-  } else {
-    log.warn(`Proxy setting may not have taken effect (got: ${val})`);
-  }
-  if (proxyTool === "burp") {
-    log.info("  Reminder: make sure Burp Suite is listening on all interfaces (0.0.0.0)");
-    log.info(`  Burp > Proxy > Proxy Listeners > Binding address = All interfaces, port ${port}`);
-  } else {
-    log.info(`  Reminder: make sure your proxy tool is listening on ${host}:${port} (all interfaces).`);
-  }
-}
-
 // ── APK install ───────────────────────────────────────────────────────────────
 
 function installApk(adb: ReturnType<typeof findAdb>, apkPath: string): void {
@@ -175,13 +169,21 @@ function installApk(adb: ReturnType<typeof findAdb>, apkPath: string): void {
   const serialArgs = adb.serial ? ["-s", adb.serial] : [];
   const r = run(adb.exePath, [...serialArgs, "install", "-r", "-t", apkPath]);
   if (!r.ok || r.stdout.includes("Failure")) {
-    throw new Error(`APK install failed:\n${r.stderr.trim() || r.stdout.trim()}`);
+    throw new Error(
+      `APK install failed:\n${r.stderr.trim() || r.stdout.trim()}`,
+    );
   }
   log.good("APK installed.");
 }
 
-function packageInstalled(adb: ReturnType<typeof findAdb>, pkg: string): boolean {
-  return adb.shell(`pm path ${pkg}`).split(/\r?\n/).some(line => line.trim().startsWith("package:"));
+function packageInstalled(
+  adb: ReturnType<typeof findAdb>,
+  pkg: string,
+): boolean {
+  return adb
+    .shell(`pm path ${pkg}`)
+    .split(/\r?\n/)
+    .some((line) => line.trim().startsWith("package:"));
 }
 
 async function transferPackage(
@@ -190,7 +192,9 @@ async function transferPackage(
   targetSerial: string,
 ): Promise<void> {
   log.step("Automatic package recovery");
-  log.info(`Package is not ready on ${targetSerial}; using source ${sourceSerial}.`);
+  log.info(
+    `Package is not ready on ${targetSerial}; using source ${sourceSerial}.`,
+  );
   const code = await runLive("bun", [
     "src/transfer.ts",
     `--package=${pkg}`,
@@ -198,113 +202,10 @@ async function transferPackage(
     `--target-serial=${targetSerial}`,
   ]);
   if (code !== 0) {
-    throw new Error(`Automatic package recovery failed with exit code ${code}.`);
-  }
-}
-
-function findBurpCertificate(labRoot: string, requested?: string): string | null {
-  if (requested) return existsSync(requested) ? requested : null;
-  const certDir = join(labRoot, "cert");
-  if (!existsSync(certDir)) return null;
-  const name = readdirSync(certDir).find(file =>
-    !file.startsWith(".") && /\.(cer|crt|der|pem)$/i.test(file)
-  );
-  return name ? join(certDir, name) : null;
-}
-
-function downloadBurpCertificate(labRoot: string, host: string, port: number): string | null {
-  const certDir = join(labRoot, "cert");
-  const certPath = join(certDir, "burp-ca.cer");
-  mkdirSync(certDir, { recursive: true });
-
-  log.step("Burp CA certificate");
-  if (existsSync(certPath) && statSync(certPath).size > 0) {
-    log.good(`Burp CA already available: ${certPath}`);
-    return certPath;
-  }
-
-  log.info(`Downloading Burp CA from http://burp/cert via ${host}:${port}…`);
-  const result = run("curl", [
-    "--fail", "--silent", "--show-error",
-    "--proxy", `http://${host}:${port}`,
-    "http://burp/cert",
-    "--output", certPath,
-  ]);
-  if (result.ok && existsSync(certPath) && statSync(certPath).size > 0) {
-    log.good(`Burp CA downloaded to ${certPath}`);
-    return certPath;
-  }
-
-  log.warn(`Could not download Burp CA automatically: ${result.stderr.trim() || "Burp listener did not respond"}`);
-  return null;
-}
-
-function prepareAndroidCertificate(labRoot: string, certPath: string): { hash: string; derPath: string } {
-  const derPath = join(labRoot, "cert", ".burp-ca.der");
-  for (const format of ["DER", "PEM"]) {
-    const hashResult = run("openssl", ["x509", "-subject_hash_old", "-inform", format, "-in", certPath]);
-    const hash = hashResult.stdout.split(/\r?\n/).map(line => line.trim()).find(line => /^[0-9a-f]{8}$/i.test(line));
-    if (!hash) continue;
-
-    if (format === "DER") {
-      if (certPath !== derPath) copyFileSync(certPath, derPath);
-    } else {
-      const convert = run("openssl", ["x509", "-in", certPath, "-outform", "DER", "-out", derPath]);
-      if (!convert.ok) throw new Error(`Could not convert Burp CA to DER: ${convert.stderr.trim()}`);
-    }
-    return { hash: hash.toLowerCase(), derPath };
-  }
-  throw new Error(`Burp CA is not a readable X.509 certificate: ${certPath}`);
-}
-
-async function ensureBurpCertificate(
-  adb: ReturnType<typeof findAdb>,
-  labRoot: string,
-  platform: ReturnType<typeof detectPlatform>,
-  burpHost: string,
-  burpPort: number,
-  requestedPath?: string,
-  proxyTool: "burp" | "other" = "burp",
-): Promise<void> {
-  // downloadBurpCertificate() only works for Burp's magic http://burp/cert
-  // endpoint — a different proxy tool (mitmproxy's http://mitm.it, etc.)
-  // wouldn't answer there, so skip straight to the manual/--proxy-cert path
-  // when the user has told us they're not using Burp.
-  const autoDownload = () => proxyTool === "burp" ? downloadBurpCertificate(labRoot, burpHost, burpPort) : null;
-
-  let certPath = findBurpCertificate(labRoot, requestedPath) ?? autoDownload();
-  if (!certPath) {
-    log.warn(proxyTool === "burp"
-      ? "Proxy CA was not found or could not be downloaded."
-      : "Proxy CA was not found under cert/.");
-    if (proxyTool === "burp") {
-      log.info("Export Burp's CA from http://burp/cert and save it as cert/burp-ca.cer.");
-    } else {
-      log.info("Export your proxy tool's CA certificate and save it under cert/ (any .cer/.crt/.der/.pem file).");
-    }
-    log.info("Alternatively pass --proxy-cert=<path> to use a certificate elsewhere.");
-    const answer = prompt("After placing the certificate, type y to retry: ");
-    if (answer?.trim().toLowerCase() !== "y") {
-      throw new Error("Proxy CA setup cancelled. No certificate was provided.");
-    }
-    certPath = findBurpCertificate(labRoot, requestedPath) ?? autoDownload();
-    if (!certPath) {
-      throw new Error("Proxy CA is still missing. Save it under cert/ and rerun.");
-    }
-  }
-
-  const { hash, derPath } = prepareAndroidCertificate(labRoot, certPath);
-  log.info(`Using proxy CA: ${certPath}`);
-  log.info(`Installing into system trust store as ${hash}.0 (tmpfs overlay, no writable-system/reboot)…`);
-  const ok = adb.installSystemCert(derPath, hash, (local, remote) => adb.push(local, remote, platform));
-  if (!ok) {
     throw new Error(
-      "Proxy CA was not installed into the system trust store.\n" +
-      "The device must be rooted (it is, per the root check). As a fallback you can\n" +
-      "intercept HTTPS via the Frida SSL-unpinning script: --frida-script=scripts/ssl-unpinning.js",
+      `Automatic package recovery failed with exit code ${code}.`,
     );
   }
-  log.good(`Proxy system CA installed: /system/etc/security/cacerts/${hash}.0`);
 }
 
 // ── App launch ────────────────────────────────────────────────────────────────
@@ -313,16 +214,28 @@ async function ensureBurpCertificate(
  * Resolve the main activity for a package by querying the package manager.
  * Falls back to just the package name (some apps handle bare package starts).
  */
-function resolveMainActivity(adb: ReturnType<typeof findAdb>, pkg: string): string | null {
-  const out = adb.shell(`cmd package resolve-activity --brief ${pkg} 2>/dev/null`);
+function resolveMainActivity(
+  adb: ReturnType<typeof findAdb>,
+  pkg: string,
+): string | null {
+  const out = adb.shell(
+    `cmd package resolve-activity --brief ${pkg} 2>/dev/null`,
+  );
   // Output last non-empty line looks like: com.example.app/.MainActivity
-  const lines = out.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  const lines = out
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
   const last = lines[lines.length - 1];
   if (last && last.includes("/")) return last;
   return null;
 }
 
-function launchApp(adb: ReturnType<typeof findAdb>, pkg: string, activity?: string): void {
+function launchApp(
+  adb: ReturnType<typeof findAdb>,
+  pkg: string,
+  activity?: string,
+): void {
   log.step("Launch app");
   const target = activity ?? resolveMainActivity(adb, pkg);
   if (target) {
@@ -342,17 +255,32 @@ function launchApp(adb: ReturnType<typeof findAdb>, pkg: string, activity?: stri
  * Check whether frida-server is running on the device.
  * Returns the PID if found, null otherwise.
  */
-function getFridaServerPid(adb: ReturnType<typeof findAdb>, version: string): string | null {
-  const pid = adb.rootShell(`pidof frida-server-${version} 2>/dev/null || true`).trim();
+function getFridaServerPid(
+  adb: ReturnType<typeof findAdb>,
+  version: string,
+): string | null {
+  const pid = adb
+    .rootShell(`pidof frida-server-${version} 2>/dev/null || true`)
+    .trim();
   return pid || null;
 }
 
-function getAppPid(adb: ReturnType<typeof findAdb>, pkg: string): string | null {
-  const pid = adb.shell(`pidof ${pkg} 2>/dev/null || true`).trim().split(/\s+/)[0];
+function getAppPid(
+  adb: ReturnType<typeof findAdb>,
+  pkg: string,
+): string | null {
+  const pid = adb
+    .shell(`pidof ${pkg} 2>/dev/null || true`)
+    .trim()
+    .split(/\s+/)[0];
   return /^\d+$/.test(pid) ? pid : null;
 }
 
-function waitForAppPid(adb: ReturnType<typeof findAdb>, pkg: string, timeoutMs = 10_000): string | null {
+function waitForAppPid(
+  adb: ReturnType<typeof findAdb>,
+  pkg: string,
+  timeoutMs = 10_000,
+): string | null {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const pid = getAppPid(adb, pkg);
@@ -378,6 +306,26 @@ async function attachFrida(
   verbose: boolean,
 ): Promise<void> {
   log.step("Frida attach");
+
+  // Frida's interactive REPL needs a minimum terminal size to draw its
+  // prompt — too small and it just prints "Window too small..." and never
+  // shows a usable console, even though the attach/script-load above it
+  // succeeded fine. Catch that up front with a clear, actionable message
+  // instead of letting the cryptic "Window too small..." be the only sign
+  // something's wrong.
+  const MIN_COLS = 80;
+  const MIN_ROWS = 20;
+  if (process.stdout.isTTY) {
+    const cols = process.stdout.columns ?? 0;
+    const rows = process.stdout.rows ?? 0;
+    if (cols < MIN_COLS || rows < MIN_ROWS) {
+      throw new Error(
+        `Terminal window is too small for Frida's interactive console ` +
+          `(need at least ${MIN_COLS}x${MIN_ROWS}, got ${cols}x${rows}).\n` +
+          `Enlarge your terminal window (or maximize it), then run this same command again.`,
+      );
+    }
+  }
 
   const args: string[] = ["-D", serial];
 
@@ -412,7 +360,7 @@ async function attachFrida(
   const proc = Bun.spawn(["frida", ...args], {
     stdout: "inherit",
     stderr: "inherit",
-    stdin:  "inherit",
+    stdin: "inherit",
   });
   const code = await proc.exited;
   if (code !== 0) {
@@ -429,22 +377,24 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  const labRoot  = import.meta.dir;
+  const labRoot = import.meta.dir;
   const platform = detectPlatform();
-  const cfg      = loadConfig(labRoot);
+  const cfg = loadConfig(labRoot);
   activatePortablePython(cfg);
-  const runOpts  = parseRunArgs(process.argv);
+  const runOpts = parseRunArgs(process.argv);
 
   // ── Header ─────────────────────────────────────────────────────────────────
   console.log("\n\x1b[1m╔══════════════════════════════════════╗\x1b[0m");
-  console.log(  "\x1b[1m║    Android Pentest Lab — Run         ║\x1b[0m");
-  console.log(  "\x1b[1m╚══════════════════════════════════════╝\x1b[0m");
+  console.log("\x1b[1m║    Android Pentest Lab — Run         ║\x1b[0m");
+  console.log("\x1b[1m╚══════════════════════════════════════╝\x1b[0m");
   printConfig(cfg);
   log.blank();
 
   // ── Require --package ──────────────────────────────────────────────────────
   if (!runOpts.package) {
-    fail("--package=<app.package.name> is required.\n\n  Example: bun run.ts --package=com.example.app");
+    fail(
+      "--package=<app.package.name> is required.\n\n  Example: bun run.ts --package=com.example.app",
+    );
   }
   log.info(`Target: ${runOpts.package}`);
 
@@ -457,8 +407,8 @@ async function main(): Promise<void> {
   if (!emulator) {
     fail(
       "No emulator visible to ADB.\n" +
-      "  Start the lab first: bun run init\n" +
-      "  Or start the emulator manually and rerun.",
+        "  Start the lab first: bun run init\n" +
+        "  Or start the emulator manually and rerun.",
     );
   }
   log.good(`Emulator connected: ${emulator}`);
@@ -472,6 +422,11 @@ async function main(): Promise<void> {
     log.good("Android is fully booted.");
   }
 
+  // Raise + maximize the emulator window right before handing off to the
+  // Frida REPL, so the app is visible and on top while you interact with it
+  // to generate traffic (the Frida REPL runs in this terminal behind it).
+  bringEmulatorWindowToFront(cfg.avdName);
+
   // ── 2. Root check ──────────────────────────────────────────────────────────
   log.step("Root");
   adb.verifyRoot();
@@ -484,7 +439,7 @@ async function main(): Promise<void> {
   }
   log.good(`Host frida: ${fridaVersion}`);
 
-  const abi        = adb.getAbi();
+  const abi = adb.getAbi();
   const serverPath = await getFridaServer(fridaVersion, abi, cfg, platform);
 
   const existingPid = getFridaServerPid(adb, fridaVersion);
@@ -492,7 +447,9 @@ async function main(): Promise<void> {
     // Verify it's actually reachable
     const check = run("frida-ps", ["-D", cfg.targetSerial]);
     if (check.ok) {
-      log.good(`frida-server already running (PID=${existingPid}) and reachable.`);
+      log.good(
+        `frida-server already running (PID=${existingPid}) and reachable.`,
+      );
     } else {
       log.warn("frida-server PID found but not reachable — redeploying…");
       await deployFridaServer(adb, serverPath, fridaVersion, cfg, platform);
@@ -506,8 +463,16 @@ async function main(): Promise<void> {
 
   // ── 4. Proxy (Burp by default) ─────────────────────────────────────────────
   if (runOpts.burp) {
-    setBurpProxy(adb, cfg.burpHost, cfg.burpPort, runOpts.proxyTool);
-    await ensureBurpCertificate(adb, labRoot, platform, cfg.burpHost, cfg.burpPort, runOpts.burpCert, runOpts.proxyTool);
+    setDeviceProxy(adb, cfg.burpHost, cfg.burpPort, runOpts.proxyTool);
+    await ensureProxyCertificate(
+      adb,
+      labRoot,
+      platform,
+      cfg.burpHost,
+      cfg.burpPort,
+      runOpts.burpCert,
+      runOpts.proxyTool,
+    );
   } else {
     log.info("Proxy setup skipped (--no-proxy).");
   }
@@ -516,21 +481,29 @@ async function main(): Promise<void> {
   let packageReady = packageInstalled(adb, runOpts.package);
   if (runOpts.apk) {
     if (!existsSync(runOpts.apk)) {
-      log.warn(`APK not found: ${runOpts.apk}; trying the Play Store source instead.`);
+      log.warn(
+        `APK not found: ${runOpts.apk}; trying the Play Store source instead.`,
+      );
     } else {
       try {
         installApk(adb, runOpts.apk);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (!/MISSING_SPLIT|INSTALL_FAILED/i.test(message)) throw error;
-        log.warn("Local APK is incomplete; trying the Play Store source instead.");
+        log.warn(
+          "Local APK is incomplete; trying the Play Store source instead.",
+        );
       }
       packageReady = packageInstalled(adb, runOpts.package);
     }
   }
 
   if (!packageReady) {
-    await transferPackage(runOpts.package, runOpts.sourceSerial, cfg.targetSerial);
+    await transferPackage(
+      runOpts.package,
+      runOpts.sourceSerial,
+      cfg.targetSerial,
+    );
   }
 
   // ── 6. Launch app ──────────────────────────────────────────────────────────
@@ -548,16 +521,18 @@ async function main(): Promise<void> {
     }
   }
 
-  // Raise + maximize the emulator window right before handing off to the
-  // Frida REPL, so the app is visible and on top while you interact with it
-  // to generate traffic (the Frida REPL runs in this terminal behind it).
-  bringEmulatorWindowToFront(cfg.avdName);
-
   // ── 8. Attach Frida ────────────────────────────────────────────────────────
-  await attachFrida(runOpts.package, adb, cfg.targetSerial, fridaScript, runOpts.spawnMode, runOpts.verbose);
+  await attachFrida(
+    runOpts.package,
+    adb,
+    cfg.targetSerial,
+    fridaScript,
+    runOpts.spawnMode,
+    runOpts.verbose,
+  );
 }
 
-main().catch(err => {
+main().catch((err) => {
   log.blank();
   fail(err instanceof Error ? err.message : String(err));
 });

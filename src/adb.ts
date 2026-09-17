@@ -1,7 +1,7 @@
 // ── ADB wrapper ───────────────────────────────────────────────────────────────
 import { existsSync } from "fs";
 import { join } from "path";
-import { run, runOrFail } from "./exec.ts";
+import { run } from "./exec.ts";
 import { log } from "./log.ts";
 import { toWinPath } from "./platform.ts";
 import type { PlatformInfo } from "./platform.ts";
@@ -121,29 +121,41 @@ export class Adb {
 
   // ── Boot helpers ──────────────────────────────────────────────────────────
 
-  waitForDevice(): void {
-    const args = this.serial
-      ? ["-s", this.serial, "wait-for-device"]
-      : ["wait-for-device"];
-    runOrFail(this.exePath, args);
-  }
-
+  /**
+   * Wait (bounded) for the device to come online and finish booting.
+   *
+   * Deliberately does NOT use `adb wait-for-device` — that blocks forever
+   * with no output at all if the emulator never registers (e.g. it failed
+   * to start because hardware acceleration/WHPX isn't available on the
+   * machine), which is exactly the "status not shown anything, stuck
+   * pending" symptom reported on a different machine. Polling `get-state` +
+   * `sys.boot_completed` within the configured timeout instead means a dead
+   * launch always surfaces a clear, bounded error.
+   */
   waitForBoot(timeoutSec = 300): void {
     log.info(`Waiting for Android boot (timeout ${timeoutSec}s)…`);
-    this.waitForDevice();
-
     const deadline = Date.now() + timeoutSec * 1_000;
+    let sawDevice = false;
     while (Date.now() < deadline) {
-      if (this.shell("getprop sys.boot_completed") === "1") {
-        process.stdout.write("\n");
-        log.good("Android boot completed.");
-        return;
+      const state = this.exec("get-state");
+      if (state.ok && state.stdout.trim() === "device") {
+        sawDevice = true;
+        if (this.shell("getprop sys.boot_completed") === "1") {
+          process.stdout.write("\n");
+          log.good("Android boot completed.");
+          return;
+        }
       }
       Bun.sleepSync(3_000);
-      process.stdout.write(".");
+      process.stdout.write(sawDevice ? "." : "o"); // 'o' = not visible to adb yet
     }
     process.stdout.write("\n");
-    throw new Error(`Android did not boot within ${timeoutSec}s.`);
+    throw new Error(
+      `Android did not boot within ${timeoutSec}s` +
+      (sawDevice
+        ? " (device connected but sys.boot_completed never reached 1)."
+        : " (the emulator never connected to adb — check that hardware acceleration/virtualization is enabled: WHPX on Windows, VT-x/AMD-V in BIOS)."),
+    );
   }
 
   /**
