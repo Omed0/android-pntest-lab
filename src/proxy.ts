@@ -48,6 +48,34 @@ export function setDeviceProxy(
   }
 }
 
+/**
+ * Read back the device's current global HTTP/HTTPS proxy setting.
+ * `adb shell settings get global http_proxy` prints "null" (not the string
+ * "null" wrapped in anything special) when nothing is set.
+ */
+export function getDeviceProxy(adb: ReturnType<typeof findAdb>): string | null {
+  const val = adb.shell("settings get global http_proxy").trim();
+  return val && val !== "null" ? val : null;
+}
+
+/**
+ * Clear the device's global HTTP/HTTPS proxy (`settings put global
+ * http_proxy :0`, the standard way to reset it back to "no proxy" — an
+ * empty string does not reliably clear it on every Android version, `:0`
+ * does). Traffic goes direct again after this.
+ */
+export function clearDeviceProxy(adb: ReturnType<typeof findAdb>): void {
+  log.step("Proxy");
+  log.info("Clearing device proxy…");
+  adb.shell("settings put global http_proxy :0");
+  const val = getDeviceProxy(adb);
+  if (val === null) {
+    log.good("Proxy cleared — traffic goes direct.");
+  } else {
+    log.warn(`Proxy setting may not have cleared (got: ${val})`);
+  }
+}
+
 function findProxyCertificate(labRoot: string, requested?: string): string | null {
   if (requested) return existsSync(requested) ? requested : null;
   const certDir = join(labRoot, "cert");
@@ -69,10 +97,21 @@ function downloadBurpCertificate(labRoot: string, host: string, port: number): s
     return certPath;
   }
 
-  log.info(`Downloading Burp CA from http://burp/cert via ${host}:${port}…`);
+  // This curl runs on the HOST (not inside the emulator), so it must use a
+  // host-reachable address. `host` here is normally "10.0.2.2" — the
+  // Android emulator's own alias for the host's loopback interface, valid
+  // ONLY from inside the guest. The host itself can never reach "10.0.2.2"
+  // (confirmed directly: it's not a real interface on the host machine at
+  // all), so the auto-download silently failed every time this ran with
+  // the default burpHost, regardless of whether Burp was even running.
+  // Substitute 127.0.0.1 for exactly that one well-known alias; any other
+  // host value (e.g. a LAN IP for a physical device) is already reachable
+  // from both sides and is used as-is.
+  const fetchHost = host === "10.0.2.2" ? "127.0.0.1" : host;
+  log.info(`Downloading Burp CA from http://burp/cert via ${fetchHost}:${port}…`);
   const result = run("curl", [
     "--fail", "--silent", "--show-error",
-    "--proxy", `http://${host}:${port}`,
+    "--proxy", `http://${fetchHost}:${port}`,
     "http://burp/cert",
     "--output", certPath,
   ]);

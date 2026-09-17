@@ -26,7 +26,7 @@ import { detectPlatform } from "./src/platform.ts";
 import { DEFAULTS, loadConfig, printConfig } from "./src/config.ts";
 import { findAdb } from "./src/adb.ts";
 import { bringEmulatorWindowToFront } from "./src/avd.ts";
-import { setDeviceProxy, ensureProxyCertificate } from "./src/proxy.ts";
+import { setDeviceProxy, ensureProxyCertificate, clearDeviceProxy, getDeviceProxy } from "./src/proxy.ts";
 import {
   activatePortablePython,
   getHostFridaVersion,
@@ -49,6 +49,7 @@ interface RunOptions {
   proxyTool: "burp" | "other";
   spawnMode: boolean; // --spawn: use frida --spawn instead of attaching
   verbose: boolean;
+  clearProxy: boolean;
 }
 
 function parseRunArgs(argv: string[]): RunOptions {
@@ -57,6 +58,7 @@ function parseRunArgs(argv: string[]): RunOptions {
     proxyTool: "burp",
     spawnMode: false,
     verbose: false,
+    clearProxy: false,
     sourceSerial: process.env.LAB_SOURCE_SERIAL ?? DEFAULTS.sourceSerial,
   };
 
@@ -95,6 +97,9 @@ function parseRunArgs(argv: string[]): RunOptions {
       case "proxy-tool":
         opts.proxyTool = val === "other" ? "other" : "burp";
         break;
+      case "clear-proxy":
+        opts.clearProxy = true;
+        break;
       case "spawn":
         opts.spawnMode = true;
         break;
@@ -132,6 +137,11 @@ function printRunHelp(): void {
                             to cert/ or --proxy-cert=<path>.
   --no-proxy                Skip proxy configuration on device entirely
                             (alias: --no-burp)
+  --clear-proxy             Clear the device's proxy setting and exit
+                            immediately (no package/APK/Frida steps run).
+                            Uses --target-serial/--proxy-host/--proxy-port
+                            from config, same as everything else — no need
+                            to hand-run adb yourself.
   --spawn                   Use frida --spawn instead of attaching to running process
   --verbose, -v             Print extra debug output
   --help, -h                Show this help
@@ -155,6 +165,9 @@ function printRunHelp(): void {
 
   # Skip proxy setup entirely
   bun run.ts --package=com.example.app --no-proxy
+
+  # Clear the device's proxy (send traffic direct again)
+  bun run.ts --clear-proxy
 `);
 }
 
@@ -389,6 +402,19 @@ async function main(): Promise<void> {
   console.log("\x1b[1m╚══════════════════════════════════════╝\x1b[0m");
   printConfig(cfg);
   log.blank();
+
+  // ── --clear-proxy: standalone action, exits immediately ───────────────────
+  if (runOpts.clearProxy) {
+    const adb = findAdb(platform, cfg.sdkRoot, cfg.targetSerial);
+    adb.startServer();
+    if (!adb.getEmulator()) {
+      fail(`No emulator visible to ADB on serial ${cfg.targetSerial}.`);
+    }
+    const before = getDeviceProxy(adb);
+    log.info(`Current proxy: ${before ?? "(none)"}`);
+    clearDeviceProxy(adb);
+    return;
+  }
 
   // ── Require --package ──────────────────────────────────────────────────────
   if (!runOpts.package) {

@@ -7,7 +7,7 @@ import { avdmanagerPath, emulatorPath, ensureSdk, sdkmanagerPath } from "./sdk.t
 import { Adb, findAdb } from "./adb.ts";
 import { DEFAULTS, loadConfig, printConfig } from "./config.ts";
 import { ensureMagiskRoot } from "./magisk.ts";
-import { setDeviceProxy, ensureProxyCertificate } from "./proxy.ts";
+import { setDeviceProxy, ensureProxyCertificate, clearDeviceProxy, getDeviceProxy } from "./proxy.ts";
 import { fail, log } from "./log.ts";
 import {
   ensureFridaHost,
@@ -247,6 +247,22 @@ export async function initializeLab(labRoot: string, argv: string[]): Promise<vo
   if (!Number.isFinite(options.timeoutSec) || options.timeoutSec <= 0) fail("--timeout must be positive.");
   const platform = detectPlatform();
   const cfg = loadConfig(labRoot, argv);
+
+  // --clear-proxy: standalone action against the already-running target,
+  // using the same --target-serial/--sdk-root resolution as everything
+  // else — no need to hand-build adb commands. Exits immediately, same as
+  // `bun run run -- --clear-proxy`.
+  if (argv.includes("--clear-proxy")) {
+    const sdkRoot = await ensureSdk(cfg, platform);
+    const adb = findAdb(platform, sdkRoot, cfg.targetSerial);
+    adb.startServer();
+    if (!adb.getEmulator()) fail(`No emulator visible to ADB on serial ${cfg.targetSerial}.`);
+    const before = getDeviceProxy(adb);
+    log.info(`Current proxy: ${before ?? "(none)"}`);
+    clearDeviceProxy(adb);
+    return;
+  }
+
   console.log("\nAndroid Pentest Lab - initialization");
   console.log(`  Rooted target: ${cfg.targetSerial} (${cfg.avdName})`);
   console.log(`  Play Store source: ${options.sourceSerial} (${options.sourceAvd})\n`);
