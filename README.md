@@ -300,23 +300,51 @@ bun run run -- --package=com.example.authorized
 
 ## SSL/TLS pinning bypass
 
-`scripts/ssl-unpinning.js` is a generic, reusable pinning-bypass Frida
-script (separate from `scripts/hook.js`, a minimal placeholder meant to be
-replaced per-app):
+`bun run run` loads the [HTTPToolkit unpinning
+suite](https://github.com/httptoolkit/frida-interception-and-unpinning)
+(vendored under `scripts/unpinning/`) **automatically, by default** — no
+flag needed. It covers far more real apps than a single hand-written script
+can:
 
-```powershell
-bun run run -- --package=<pkg> --frida-script=scripts/ssl-unpinning.js
+| Script | What it covers |
+|---|---|
+| `native-connect-hook.js` | Redirects all raw socket connections to the proxy, even ones that ignore system proxy settings entirely. |
+| `native-tls-hook.js` | Patches BoringSSL-level TLS validation directly — the layer Flutter, most native code, and many hybrid frameworks actually use instead of the Java TLS stack. |
+| `android-proxy-override.js` | Forces the app's own proxy config to the configured host/port. |
+| `android-system-certificate-injection.js` | Native-level system trust store injection (complements, doesn't replace, the tmpfs overlay `run`/`init` already install). |
+| `android-certificate-unpinning.js` | OkHttp, TrustKit, Appmattus, and other named pinning libraries. |
+| `android-certificate-unpinning-fallback.js` | **Auto-detects and patches unrecognized pinning failures on the fly**, and when it genuinely can't, prints a loud, unmissable alert — see below. |
+| `android-disable-root-detection.js` | Common root/Magisk detection checks (file existence, `su`, system properties). |
+| `android-disable-flutter-certificate-pinning.js` | Flutter's own bundled TLS stack, which ignores the system trust store and most Java-level hooks entirely. |
+
+`bun run run` generates a fresh `scripts/unpinning/config.generated.js` on
+every run (gitignored) from your live `--proxy-host`/`--proxy-port` and the
+currently-installed proxy CA — no manual editing of `config.js` needed.
+
+**If it can't bypass something**: the fallback layer prints this to the
+Frida console when a pinning failure isn't one of the patterns it
+recognizes:
+
+```
+!!! --- Unexpected TLS failure --- !!!
+...
+[ ] Unrecognized TLS error - this must be patched manually
 ```
 
-It patches OkHttp's `CertificatePinner`, `WebViewClient.onReceivedSslError`
-(covers WebView/hybrid apps), and conscrypt's `TrustManagerImpl.verifyChain`,
-skipping any hook whose target class isn't present instead of throwing. The
-`javax.net.ssl.SSLContext.init`/`TrustManager` override is **off by default**
-(see the KNOWN ISSUE comment at the top of the file — it's been observed to
-crash a specific .NET MAUI app at process-bind time). Installing the CA into
-the rooted system trust store (which `run` already does automatically) is
-frequently enough on its own for apps with no custom pinning logic at all —
-try that first.
+That's your signal to write a small app-specific hook. Drop it at
+`scripts/custom/<package.name>.js` — it's picked up and loaded automatically
+(after the whole suite) the next time you run that package, no flag needed.
+See `scripts/custom/README.md` for a template and this lab's own documented
+case (a MAUI app whose `SSLContext.init` crashes if hooked directly — the
+suite's native-level hook already avoids that call path, so no custom
+script was actually needed there, but the writeup is a useful example of
+how to reason about one).
+
+**Your own extra instrumentation**: `--frida-script=<path>` loads an
+additional script *on top of* the unpinning suite (not instead of it) —
+use it for app-logic hooks unrelated to pinning. `--no-unpinning` skips the
+suite entirely and falls back to `--frida-script` alone (or
+`scripts/hook.js`, a minimal placeholder, if neither is given).
 
 ## Project layout
 
@@ -326,14 +354,17 @@ android-pentest-lab/
   run.ts                   App launch, proxy, certificate, and Frida attach
   verify.ts                Target health check
   scripts/hook.js          Minimal placeholder Frida hook
-  scripts/ssl-unpinning.js Universal SSL/TLS pinning bypass
+  scripts/unpinning/       Vendored HTTPToolkit unpinning suite (loaded by default)
+  scripts/custom/          Your own per-package pinning fixes (auto-loaded by package name)
   src/
     lab.ts                 init/clean orchestration and CLI
     transfer.ts            Split APK transfer (source -> target)
     apkinfo.ts             Read an APK's package name/version without installing
+    unpinning.ts           Builds the HTTPToolkit script chain + generates its config
     adb.ts                 Serial-aware ADB wrapper, root detection, CA install
     avd.ts                 AVD creation, GPU config, window lock/raise, launch
     magisk.ts              Optional real Magisk root via rootAVD (--magisk-root)
+    proxy.ts               Device proxy + CA cert install/clear (shared by init and run)
     config.ts              Defaults, flags, and LAB_* variables
     download.ts            Download/extraction helpers, Java/7-Zip bootstrap
     exec.ts                Process execution

@@ -27,6 +27,7 @@ import { DEFAULTS, loadConfig, printConfig } from "./src/config.ts";
 import { findAdb } from "./src/adb.ts";
 import { bringEmulatorWindowToFront } from "./src/avd.ts";
 import { setDeviceProxy, ensureProxyCertificate, clearDeviceProxy, getDeviceProxy } from "./src/proxy.ts";
+import { buildUnpinningScriptChain } from "./src/unpinning.ts";
 import {
   activatePortablePython,
   getHostFridaVersion,
@@ -50,6 +51,7 @@ interface RunOptions {
   spawnMode: boolean; // --spawn: use frida --spawn instead of attaching
   verbose: boolean;
   clearProxy: boolean;
+  noUnpinning: boolean;
 }
 
 function parseRunArgs(argv: string[]): RunOptions {
@@ -59,6 +61,7 @@ function parseRunArgs(argv: string[]): RunOptions {
     spawnMode: false,
     verbose: false,
     clearProxy: false,
+    noUnpinning: false,
     sourceSerial: process.env.LAB_SOURCE_SERIAL ?? DEFAULTS.sourceSerial,
   };
 
@@ -100,6 +103,9 @@ function parseRunArgs(argv: string[]): RunOptions {
       case "clear-proxy":
         opts.clearProxy = true;
         break;
+      case "no-unpinning":
+        opts.noUnpinning = true;
+        break;
       case "spawn":
         opts.spawnMode = true;
         break;
@@ -127,7 +133,13 @@ function printRunHelp(): void {
 \x1b[1mOptional\x1b[0m
   --apk=<path>              Install this APK before launching
   --main-activity=<name>    Activity to start (default: resolved from package)
-  --frida-script=<path>     Frida JS script to load (default: scripts/hook.js if it exists)
+  --frida-script=<path>     EXTRA Frida JS script, loaded after the unpinning
+                            suite below (your own app-specific instrumentation).
+                            Not a replacement for it unless --no-unpinning is
+                            also passed.
+  --no-unpinning            Skip the HTTPToolkit unpinning suite entirely.
+                            Falls back to loading only --frida-script (or
+                            scripts/hook.js, a minimal smoke test, if unset).
   --source-serial=<id>      Play Store source emulator for automatic package recovery
   --proxy-cert=<path>       Proxy CA certificate (default: first cert in ./cert)
                             (alias: --burp-cert)
@@ -150,12 +162,22 @@ function printRunHelp(): void {
   --avd-name, --sdk-root, --frida-version, --proxy-host, --proxy-port, ...
   Run \`bun run init -- --help\` for the full list.
 
+\x1b[1mCustom per-app pinning fixes\x1b[0m
+  If the unpinning suite's own fallback layer logs "must be patched manually"
+  for a specific app, drop a hand-written Frida hook at:
+    scripts/custom/<package.name>.js
+  It's auto-loaded after the unpinning suite whenever that package is run —
+  no flag needed. See scripts/custom/README.md.
+
 \x1b[1mExamples\x1b[0m
-  # Attach to an already-running app (Burp is the default proxy)
+  # Attach to an already-running app (unpinning suite + Burp proxy, both default)
   bun run.ts --package=com.example.app
 
-  # Install APK first, then attach with a hook script
+  # Install APK first, then attach with your own extra instrumentation script
   bun run.ts --package=com.example.app --apk=./target.apk --frida-script=./scripts/hook.js
+
+  # Skip the unpinning suite entirely, use only your own script
+  bun run.ts --package=com.example.app --no-unpinning --frida-script=./scripts/hook.js
 
   # Spawn the app fresh (frida controls the lifecycle)
   bun run.ts --package=com.example.app --spawn --frida-script=./scripts/hook.js
@@ -306,15 +328,27 @@ function waitForAppPid(
 // ── Frida attach ──────────────────────────────────────────────────────────────
 
 /**
- * Attach (or spawn) Frida to the target package and optionally load a script.
- * This replaces the process with `frida` so the user sees its interactive REPL
- * (or the script output) in their terminal.
+ * Attach (or spawn) Frida to the target package, loading the HTTPToolkit
+ * unpinning suite (scripts/unpinning/ — see src/unpinning.ts) by default,
+ * plus an optional extra script layered on top. This replaces the process
+ * with `frida` so the user sees its interactive REPL (or the script output)
+ * in their terminal.
+ *
+ * @param extraScript  An additional `-l` script loaded AFTER the unpinning
+ *   chain (or alone, if noUnpinning) — for your own app-specific
+ *   instrumentation (--frida-script=<path>), separate from the automatic
+ *   per-package override at scripts/custom/<pkg>.js (which src/unpinning.ts
+ *   already appends to the chain itself when present).
  */
 async function attachFrida(
   pkg: string,
   adb: ReturnType<typeof findAdb>,
   serial: string,
-  fridaScript: string | undefined,
+  labRoot: string,
+  burpHost: string,
+  burpPort: number,
+  noUnpinning: boolean,
+  extraScript: string | undefined,
   spawnMode: boolean,
   verbose: boolean,
 ): Promise<void> {
@@ -356,13 +390,24 @@ async function attachFrida(
     }
   }
 
-  if (fridaScript) {
-    if (!existsSync(fridaScript)) {
-      throw new Error(`Frida script not found: ${fridaScript}`);
+  const scriptChain: string[] = [];
+  if (!noUnpinning) {
+    const chain = buildUnpinningScriptChain(labRoot, burpHost, burpPort, verbose, pkg);
+    if (chain) {
+      scriptChain.push(...chain);
+      log.good(`Loading HTTPToolkit unpinning suite (${chain.length} scripts).`);
+    } else {
+      log.warn("Unpinning suite unavailable this run — see warning above. Continuing without it.");
     }
-    args.push("-l", fridaScript);
-    log.info(`Loading script: ${fridaScript}`);
   }
+  if (extraScript) {
+    if (!existsSync(extraScript)) {
+      throw new Error(`Frida script not found: ${extraScript}`);
+    }
+    scriptChain.push(extraScript);
+    log.info(`Loading extra script: ${extraScript}`);
+  }
+  for (const script of scriptChain) args.push("-l", script);
 
   if (verbose) args.push("--runtime=v8");
 
@@ -538,11 +583,17 @@ async function main(): Promise<void> {
   }
 
   // ── 7. Locate Frida script ─────────────────────────────────────────────────
-  let fridaScript = runOpts.fridaScript;
-  if (!fridaScript) {
+  // The HTTPToolkit unpinning suite (scripts/unpinning/) is loaded by default
+  // inside attachFrida() — see src/unpinning.ts. --frida-script here is an
+  // ADDITIONAL script layered on top of it (your own app-specific
+  // instrumentation), not a replacement, unless --no-unpinning is passed, in
+  // which case it falls back to the old single-script behavior (defaulting
+  // to scripts/hook.js, a minimal Java-runtime smoke test, if present).
+  let extraScript = runOpts.fridaScript;
+  if (!extraScript && runOpts.noUnpinning) {
     const defaultScript = `${labRoot}/scripts/hook.js`;
     if (existsSync(defaultScript)) {
-      fridaScript = defaultScript;
+      extraScript = defaultScript;
       log.info(`Using default hook script: ${defaultScript}`);
     }
   }
@@ -552,7 +603,11 @@ async function main(): Promise<void> {
     runOpts.package,
     adb,
     cfg.targetSerial,
-    fridaScript,
+    labRoot,
+    cfg.burpHost,
+    cfg.burpPort,
+    runOpts.noUnpinning,
+    extraScript,
     runOpts.spawnMode,
     runOpts.verbose,
   );

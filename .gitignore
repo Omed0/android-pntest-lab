@@ -23,4 +23,9 @@ cert/*.pem
 # content — never committed, see README "Safety")
 testing/
 
+# Regenerated on every `bun run.ts` from the live proxy CA + host/port —
+# see src/unpinning.ts. Never hand-edit; edit scripts/unpinning/config.js's
+# template values instead, or pass different --proxy-host/--proxy-port flags.
+scripts/unpinning/config.generated.js
+
 .claude/

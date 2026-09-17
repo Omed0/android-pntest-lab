@@ -49,6 +49,23 @@ export function setDeviceProxy(
 }
 
 /**
+ * Read the currently-available proxy CA (whatever findProxyCertificate()
+ * would find — .cer/.crt/.der/.pem under cert/, or --proxy-cert) as PEM
+ * text, converting from DER if needed. Returns null if no cert is
+ * available yet or it isn't a readable X.509 certificate. Used to feed
+ * CERT_PEM into the HTTPToolkit unpinning suite's generated config.js.
+ */
+export function getProxyCertificatePem(labRoot: string, requestedPath?: string): string | null {
+  const certPath = findProxyCertificate(labRoot, requestedPath);
+  if (!certPath) return null;
+  for (const format of ["PEM", "DER"]) {
+    const result = run("openssl", ["x509", "-in", certPath, "-inform", format, "-outform", "PEM"]);
+    if (result.ok && result.stdout.includes("BEGIN CERTIFICATE")) return result.stdout.trim();
+  }
+  return null;
+}
+
+/**
  * Read back the device's current global HTTP/HTTPS proxy setting.
  * `adb shell settings get global http_proxy` prints "null" (not the string
  * "null" wrapped in anything special) when nothing is set.
@@ -76,7 +93,7 @@ export function clearDeviceProxy(adb: ReturnType<typeof findAdb>): void {
   }
 }
 
-function findProxyCertificate(labRoot: string, requested?: string): string | null {
+export function findProxyCertificate(labRoot: string, requested?: string): string | null {
   if (requested) return existsSync(requested) ? requested : null;
   const certDir = join(labRoot, "cert");
   if (!existsSync(certDir)) return null;
@@ -200,6 +217,19 @@ export async function ensureProxyCertificate(
   log.info(`Using proxy CA: ${certPath}`);
   log.info(`Installing into system trust store as ${hash}.0 (tmpfs overlay, no writable-system/reboot)…`);
   const ok = adb.installSystemCert(derPath, hash, (local, remote) => adb.push(local, remote, platform));
+
+  // Also push the same DER cert to a fixed, well-known path — this is the
+  // exact file the classic "frida-android-repinning.js"-style scripts
+  // expect at /data/local/tmp/cert-der.crt (their own usage comment says to
+  // `adb push burpca-cert-der.crt /data/local/tmp/cert-der.crt` by hand
+  // before running them). Doing it here means any such script just works
+  // without that manual step, using the exact same CA already installed
+  // into the system trust store above.
+  const REPIN_CERT_PATH = "/data/local/tmp/cert-der.crt";
+  adb.push(derPath, REPIN_CERT_PATH, platform);
+  adb.shell(`chmod 644 ${REPIN_CERT_PATH}`);
+  log.good(`CA also pushed to ${REPIN_CERT_PATH} (for repinning-style Frida scripts).`);
+
   if (!ok) {
     log.warn(
       "Proxy CA was not installed into the system trust store.\n" +
