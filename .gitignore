@@ -7,6 +7,10 @@ bun.lock
 tools/frida/
 tools/cache/
 
+# Downloaded rootAVD toolkit (large, bundles its own Magisk.zip) — see
+# ensureRootAVDToolkit() in src/magisk.ts, re-fetched automatically
+tools/rootavd/
+
 # Android SDK if installed locally inside the lab
 tools/android-sdk/
 

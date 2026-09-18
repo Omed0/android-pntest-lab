@@ -210,9 +210,29 @@ export async function bootstrapLab(labRoot: string, argv: string[] = process.arg
   }
 
   log.step("Root");
-  adb.verifyRoot();
-  log.good("Root verified on target (adb root).");
+  let alreadyRooted = true;
+  try {
+    adb.verifyRoot();
+    log.good("Root verified on target (adb root).");
+  } catch (error) {
+    // A Play Store image has neither `adb root` (blocked by Google) nor an
+    // `su` binary until Magisk is actually patched onto it — verifyRoot()
+    // throwing here is EXPECTED on a fresh --system-image-tag=google_apis_playstore
+    // target with --magisk-root, not a real failure yet. Only bail out
+    // immediately if Magisk root wasn't even requested — that's the
+    // original "genuinely unrooted, nothing more to try" case.
+    if (!cfg.magiskRoot) throw error;
+    alreadyRooted = false;
+    log.warn("adb-root unavailable (expected on a fresh Play Store image before Magisk is patched) — attempting Magisk root now…");
+  }
   await ensureMagiskRoot(cfg, platform, adb);
+  if (!alreadyRooted) {
+    // Only re-check if the first attempt above actually failed — this
+    // surfaces the real (correctly still-failing) error if the Magisk
+    // patch didn't grant root, without a redundant re-verification log
+    // when root was already confirmed working the first time.
+    adb.verifyRoot();
+  }
   const fridaVersion = await ensureFridaHost(cfg, platform);
   log.step("frida-server");
   const abi = adb.getAbi();

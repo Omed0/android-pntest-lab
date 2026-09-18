@@ -244,12 +244,35 @@ export async function ensureMagiskRoot(cfg: LabConfig, platform: PlatformInfo, a
     // exercising the su binary this is meant to confirm.
     const suCheck = adb.shell("su -c id");
     if (!/uid=0/.test(suCheck)) {
+      // Two genuinely different failure shapes, confirmed by direct testing
+      // against a real google_apis_playstore target:
+      //   - suCheck is EMPTY: the ramdisk patch or Magisk app install itself
+      //     failed — see the rootAVD output above / retry guidance below.
+      //   - suCheck is "Permission denied": the patch and daemon are BOTH
+      //     fine (confirmed via `ps -A | grep magiskd` showing it running as
+      //     root, and `pm list packages` showing com.topjohnwu.magisk
+      //     installed) — Magisk's own su ACCESS POLICY is just denying this
+      //     specific request because there's no human available to approve
+      //     the grant prompt for a headless `adb shell su` call. This is a
+      //     one-time manual step, not a retry-the-patch problem: open the
+      //     Magisk app inside the emulator (visible in its window) and set
+      //     Superuser access so ADB/shell requests are auto-granted instead
+      //     of prompted. `bun run init --magisk-root` will pick it up on
+      //     the very next run without repatching anything.
+      const deniedByPolicy = /permission denied/i.test(suCheck);
       throw new Error(
-        `Magisk patch ran but 'su -c id' did not report uid=0 (got: "${suCheck}").\n` +
-        "The ramdisk patch or the Magisk app install likely failed silently. Re-check the\n" +
-        "rootAVD output above, or force a clean retry by deleting the toolkit directory:\n" +
-        `  ${rootAvdDir}\n` +
-        "and rerunning with --magisk-root.",
+        deniedByPolicy
+          ? "Magisk patch and daemon are both fine, but 'su -c id' got \"Permission denied\" — " +
+            "this is Magisk's OWN su access policy denying a headless request with no human " +
+            "to approve the grant prompt, not a broken patch.\n" +
+            "Fix (one-time, per AVD): open the Magisk app inside the emulator window and set " +
+            "Superuser access to auto-grant (not prompt) for ADB/shell requests, then rerun " +
+            "`bun run init --magisk-root` — it will pick up the change immediately, no repatch needed."
+          : `Magisk patch ran but 'su -c id' did not report uid=0 (got: "${suCheck}").\n` +
+            "The ramdisk patch or the Magisk app install likely failed silently. Re-check the\n" +
+            "rootAVD output above, or force a clean retry by deleting the toolkit directory:\n" +
+            `  ${rootAvdDir}\n` +
+            "and rerunning with --magisk-root.",
       );
     }
     log.good("Magisk root verified via `su -c id` (uid=0).");

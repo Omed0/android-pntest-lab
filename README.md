@@ -152,14 +152,48 @@ for everything else, the default `adb root` path is faster and simpler.
 
 `--magisk-root` only ever applies to the rooted **target** AVD, never the
 Play Store **source** — the source stays intentionally locked down (no `adb
-root`, no Magisk) per the two-roles architecture described above; that's not
-something this flag changes or attempts to work around.
+root`, no Magisk) per the two-roles architecture described above.
+
+**One-time manual step, confirmed live**: after a fresh patch, `su -c id`
+can come back `Permission denied` even though the patch and `magiskd` are
+both genuinely fine — that's Magisk's own su *access policy* denying a
+headless request because there's no human to tap "Grant" on the usual
+prompt. Fix once per AVD: open the Magisk app inside the emulator window
+and set Superuser access to auto-grant (not prompt) for ADB/shell requests.
+`bun run init -- --magisk-root` picks this up immediately on the next run —
+no repatch needed. The error message distinguishes this case from a
+genuinely failed patch (empty `su -c id` output) automatically.
 
 The patch step is idempotent — rerunning `bun run init -- --magisk-root`
 detects an already-Magisk-rooted device and skips straight past it — and
-non-fatal on failure: if rootAVD's patch or the post-patch `su` check doesn't
-succeed, bootstrap logs a clear warning and continues with plain adb-root,
-rather than aborting the whole lab setup.
+non-fatal on failure: if rootAVD's patch doesn't succeed, bootstrap logs a
+clear warning and continues with plain adb-root, rather than aborting the
+whole lab setup.
+
+### Play Store *and* root on the same device
+
+Combine `--system-image-tag=google_apis_playstore` with `--magisk-root` on
+the **target** itself (not the source) to get one device with both Play
+Store and real root — confirmed working end to end. Useful when an app only
+needs Play Services to *be present* (not full Play Integrity attestation):
+sign into Play Store directly on the rooted target, install the app there,
+and skip `transfer.ts`/the source device entirely for that app.
+
+This doesn't replace the two-role architecture — it's a per-app choice:
+
+| App's requirement | Use |
+|---|---|
+| Just needs Play Services present, no strict device-integrity checks | Single rooted target with `--system-image-tag=google_apis_playstore --magisk-root` — sign in and install directly. |
+| Enforces Play Integrity / device certification strictly (common for banking, DRM/streaming apps) | Keep the default two-role setup — Play Store on a rooted/Magisk device often won't show or install these at all, regardless of hiding tricks. Install on the clean **source**, then `bun run transfer` to the rooted **target**. |
+
+If you're not sure which an app needs, try the single-device path first —
+it's simpler — and fall back to the source/transfer workflow if Play Store
+won't cooperate.
+
+An existing target AVD is **not** automatically converted — `bun run init`
+reuses an existing AVD by name as-is, ignoring `--system-image-tag` unless
+you also pass `--force-avd` (which deletes and recreates it from scratch,
+losing whatever was installed on it).
 
 ## Proxy and certificates (Burp by default — any other tool also works)
 
