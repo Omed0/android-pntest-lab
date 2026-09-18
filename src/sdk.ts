@@ -377,6 +377,23 @@ export function systemImageInstalled(cfg: LabConfig): boolean {
   return existsSync(imgPath);
 }
 
+/**
+ * Same check as systemImageInstalled(), but for an arbitrary
+ * "system-images;android-<api>;<tag>;<abi>" package id — used by the source
+ * AVD, which (unlike the target) is configured via one full package string
+ * rather than separate apiLevel/systemImageTag/abi fields on LabConfig.
+ * sdkmanager creates on-disk directories matching each package-id segment
+ * literally (confirmed: android-37.0's decimal segment is the real
+ * directory name, not just android-37), so this is a plain string split,
+ * not a re-parse into numeric fields.
+ */
+export function systemImagePackageInstalled(sdkRoot: string, imagePackage: string): boolean {
+  const parts = imagePackage.split(";"); // ["system-images", "android-37.0", "google_apis_playstore", "x86_64"]
+  if (parts.length !== 4 || parts[0] !== "system-images") return false;
+  const [, apiSegment, tag, abi] = parts;
+  return existsSync(join(sdkRoot, "system-images", apiSegment, tag, abi, "system.img"));
+}
+
 /** Emulator executable path inside the SDK. */
 export function emulatorPath(sdkRoot: string, platform: PlatformInfo): string {
   return join(sdkRoot, "emulator", `emulator${platform.exe}`);

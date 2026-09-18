@@ -3,7 +3,7 @@ import { rmSync } from "fs";
 import { run, runLive } from "./exec.ts";
 import { detectPlatform } from "./platform.ts";
 import { applyGpuConfig, bringEmulatorWindowToFront, ensureAvd, killEmulator, launchWindowsEmulator, listAvds, lockEmulatorWindow, repairAvdIdentity, resolveDeviceProfile, startEmulator } from "./avd.ts";
-import { avdmanagerPath, emulatorPath, ensureSdk, sdkmanagerPath } from "./sdk.ts";
+import { avdmanagerPath, emulatorPath, ensureSdk, sdkmanagerPath, systemImagePackageInstalled } from "./sdk.ts";
 import { Adb, findAdb } from "./adb.ts";
 import { DEFAULTS, loadConfig, printConfig } from "./config.ts";
 import { ensureMagiskRoot } from "./magisk.ts";
@@ -127,14 +127,21 @@ async function ensureSourceAvd(
 ): Promise<boolean> {
   if (listAvds(emuPath).includes(avdName)) return false;
   log.step("Play Store source AVD");
-  log.info(`Source AVD '${avdName}' is missing; installing ${imagePackage}.`);
-  // See src/sdk.ts installHeadlessSdk() for why --sdk_root=<path> must
-  // never be passed on sdkmanager.bat's argv when <path> contains a space —
-  // ANDROID_SDK_ROOT/ANDROID_HOME env vars carry it instead.
-  const imageCode = await runLive(sdkmanagerPath(sdkRoot, platform), [
-    "--install", imagePackage,
-  ], { env: { ANDROID_SDK_ROOT: sdkRoot, ANDROID_HOME: sdkRoot } });
-  if (imageCode !== 0) throw new Error(`Could not install source image '${imagePackage}'. Override --source-image-package.`);
+  log.info(`Source AVD '${avdName}' is missing.`);
+  if (systemImagePackageInstalled(sdkRoot, imagePackage)) {
+    log.good(`Source system image already installed: ${imagePackage}`);
+  } else {
+    log.info(`Installing ${imagePackage}.`);
+    // See src/sdk.ts installHeadlessSdk() for why --sdk_root=<path> must
+    // never be passed on sdkmanager.bat's argv when <path> contains a space —
+    // ANDROID_SDK_ROOT/ANDROID_HOME env vars carry it instead.
+    const imageCode = await runLive(sdkmanagerPath(sdkRoot, platform), [
+      "--install", imagePackage,
+    ], { env: { ANDROID_SDK_ROOT: sdkRoot, ANDROID_HOME: sdkRoot } });
+    if (imageCode !== 0 || !systemImagePackageInstalled(sdkRoot, imagePackage)) {
+      throw new Error(`Could not install source image '${imagePackage}'. Override --source-image-package.`);
+    }
+  }
   const avdmgr = avdmanagerPath(sdkRoot, platform);
   // Was previously hardcoded to "pixel_10_pro", which doesn't exist on the
   // device-definition list shipped with the auto-downloaded "command-line
@@ -332,7 +339,20 @@ export async function initializeLab(labRoot: string, argv: string[]): Promise<vo
   if (!existsSync(emuPath)) throw new Error(`Android Emulator not found: ${emuPath}`);
   let justCreated = false;
   if (!listAvds(emuPath).includes(options.sourceAvd)) {
-    if (!cfg.installSdk) throw new Error(`Source AVD '${options.sourceAvd}' was not found. Rerun with --install-sdk.`);
+    // Mirror the target's own gate in avd.ts ensureAvd(): only actually
+    // require --install-sdk when the source system image genuinely isn't on
+    // disk yet. A previous run's target install can leave the *target's*
+    // image ready while the source's image is already present too (shared
+    // sdkmanager cache) — this used to demand --install-sdk unconditionally
+    // the moment the AVD itself was missing, even when nothing needed
+    // downloading, which is inconsistent with how the target behaves in the
+    // exact same situation.
+    if (!cfg.installSdk && !systemImagePackageInstalled(sdkRoot, options.sourceImage)) {
+      throw new Error(
+        `Source AVD '${options.sourceAvd}' was not found and its system image (${options.sourceImage}) isn't installed yet.\n` +
+        "Rerun with: bun run init -- --install-sdk",
+      );
+    }
     justCreated = await ensureSourceAvd(sdkRoot, platform, emuPath, options.sourceAvd, options.sourceImage, cfg.sourceDeviceProfile);
   }
   // Enable GPU on the source AVD too — unconditionally, so a source AVD that
