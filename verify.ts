@@ -203,7 +203,9 @@ function summarize(allOk: boolean): void {
   console.log();
 }
 
-main().catch(err => {
-  log.blank();
-  fail(err instanceof Error ? err.message : String(err));
-});
+if (import.meta.main) {
+  main().catch(err => {
+    log.blank();
+    fail(err instanceof Error ? err.message : String(err));
+  });
+}

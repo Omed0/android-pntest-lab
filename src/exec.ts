@@ -41,19 +41,6 @@ export function run(cmd: string, args: string[] = [], opts: RunOpts = {}): RunRe
   }
 }
 
-/** Run and throw a descriptive Error on non-zero exit. Returns trimmed stdout. */
-export function runOrFail(cmd: string, args: string[] = [], opts: RunOpts = {}): string {
-  const r = run(cmd, args, opts);
-  if (!r.ok) {
-    const detail = (r.stderr.trim() || r.stdout.trim()).slice(0, 400);
-    throw new Error(
-      `Command failed (exit ${r.exitCode}): ${cmd} ${args.join(" ")}` +
-      (detail ? `\n${detail}` : ""),
-    );
-  }
-  return r.stdout.trim();
-}
-
 // ── Async (live stdio) ────────────────────────────────────────────────────────
 
 /** Run with the user's terminal attached — output is visible in real time. */

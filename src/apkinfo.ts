@@ -24,7 +24,7 @@ import { loadConfig } from "./config.ts";
 import { run } from "./exec.ts";
 import { log, fail } from "./log.ts";
 
-interface ApkInfo {
+export interface ApkInfo {
   packageName: string;
   versionName?: string;
   versionCode?: string;
@@ -34,7 +34,7 @@ interface ApkInfo {
 // ── Tool discovery ──────────────────────────────────────────────────────────
 
 /** Newest build-tools aapt/aapt2 in the SDK, or null if build-tools absent. */
-function findAapt(sdkRoot: string, platform: PlatformInfo): string | null {
+export function findAapt(sdkRoot: string, platform: PlatformInfo): string | null {
   const btRoot = join(sdkRoot, "build-tools");
   if (!existsSync(btRoot)) return null;
   const versions = readdirSync(btRoot).sort().reverse(); // newest first
@@ -47,14 +47,14 @@ function findAapt(sdkRoot: string, platform: PlatformInfo): string | null {
   return null;
 }
 
-function apkanalyzerPath(sdkRoot: string, platform: PlatformInfo): string {
+export function apkanalyzerPath(sdkRoot: string, platform: PlatformInfo): string {
   const ext = platform.type === "windows" || platform.type === "wsl" ? ".bat" : "";
   return join(sdkRoot, "cmdline-tools", "latest", "bin", `apkanalyzer${ext}`);
 }
 
 // ── Extraction ──────────────────────────────────────────────────────────────
 
-function fromAapt(aapt: string, apk: string): ApkInfo | null {
+export function fromAapt(aapt: string, apk: string): ApkInfo | null {
   // Both aapt2 and classic aapt accept identical "dump badging <apk>" args.
   const r = run(aapt, ["dump", "badging", apk]);
   if (!r.ok || !r.stdout.includes("package:")) return null;
@@ -69,7 +69,7 @@ function fromAapt(aapt: string, apk: string): ApkInfo | null {
   };
 }
 
-function fromApkanalyzer(tool: string, apk: string): ApkInfo | null {
+export function fromApkanalyzer(tool: string, apk: string): ApkInfo | null {
   const pkg = run(tool, ["manifest", "application-id", apk]);
   if (!pkg.ok) return null;
   const packageName = pkg.stdout.trim().split(/\r?\n/).pop()?.trim();
@@ -77,6 +77,17 @@ function fromApkanalyzer(tool: string, apk: string): ApkInfo | null {
   const versionName = run(tool, ["manifest", "version-name", apk]).stdout.trim().split(/\r?\n/).pop()?.trim();
   const versionCode = run(tool, ["manifest", "version-code", apk]).stdout.trim().split(/\r?\n/).pop()?.trim();
   return { packageName, versionName, versionCode };
+}
+
+/** Resolve package name/version from a local APK file, trying aapt then apkanalyzer. Used by run.ts, transfer.ts, and extract.ts. */
+export function resolveApkInfo(sdkRoot: string, platform: PlatformInfo, apk: string): ApkInfo | null {
+  const aapt = findAapt(sdkRoot, platform);
+  let info: ApkInfo | null = aapt ? fromAapt(aapt, apk) : null;
+  if (!info) {
+    const analyzer = apkanalyzerPath(sdkRoot, platform);
+    if (existsSync(analyzer)) info = fromApkanalyzer(analyzer, apk);
+  }
+  return info;
 }
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
@@ -119,13 +130,7 @@ async function main(): Promise<void> {
   const platform = detectPlatform();
   const cfg = loadConfig(labRoot, []);
 
-  const aapt = findAapt(cfg.sdkRoot, platform);
-  let info: ApkInfo | null = aapt ? fromAapt(aapt, apk!) : null;
-
-  if (!info) {
-    const analyzer = apkanalyzerPath(cfg.sdkRoot, platform);
-    if (existsSync(analyzer)) info = fromApkanalyzer(analyzer, apk!);
-  }
+  const info = resolveApkInfo(cfg.sdkRoot, platform, apk!);
 
   if (!info) {
     fail(
@@ -149,7 +154,12 @@ async function main(): Promise<void> {
   log.info(`  or:  bun run run -- --package=${info!.packageName} --apk=${apk}`);
 }
 
-main().catch(err => {
-  log.blank();
-  fail(err instanceof Error ? err.message : String(err));
-});
+// Guard against running the CLI as a side effect of importing this file's
+// exported helpers (extract.ts does exactly that) — only run when this file
+// is the actual entry point Bun was invoked with.
+if (import.meta.main) {
+  main().catch(err => {
+    log.blank();
+    fail(err instanceof Error ? err.message : String(err));
+  });
+}

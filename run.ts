@@ -36,6 +36,7 @@ import {
   verifyFridaConnection,
 } from "./src/frida.ts";
 import { run, runLive } from "./src/exec.ts";
+import { packageInstalled as sharedPackageInstalled } from "./src/apkpull.ts";
 
 // ── Run-specific CLI options ──────────────────────────────────────────────────
 
@@ -215,10 +216,10 @@ function packageInstalled(
   adb: ReturnType<typeof findAdb>,
   pkg: string,
 ): boolean {
-  return adb
-    .shell(`pm path ${pkg}`)
-    .split(/\r?\n/)
-    .some((line) => line.trim().startsWith("package:"));
+  return sharedPackageInstalled((...args) => run(adb.exePath, [
+    ...(adb.serial ? ["-s", adb.serial] : []),
+    ...args,
+  ]), pkg);
 }
 
 async function transferPackage(
@@ -613,7 +614,9 @@ async function main(): Promise<void> {
   );
 }
 
-main().catch((err) => {
-  log.blank();
-  fail(err instanceof Error ? err.message : String(err));
-});
+if (import.meta.main) {
+  main().catch((err) => {
+    log.blank();
+    fail(err instanceof Error ? err.message : String(err));
+  });
+}

@@ -9,6 +9,7 @@
     "run":        "bun run.ts",
     "transfer":   "bun src/transfer.ts",
     "apkinfo":    "bun src/apkinfo.ts",
+    "extract":    "bun src/extract.ts",
     "verify":     "bun verify.ts",
     "help":       "bun src/lab.ts help"
   },

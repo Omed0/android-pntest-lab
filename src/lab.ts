@@ -466,6 +466,7 @@ Usage
 Other utility commands
   bun run transfer -- --package=<pkg>   Copy an app between two connected devices
   bun run apkinfo -- <path-to.apk>      Read package name / version / main activity from an APK
+  bun run extract -- --package=<pkg>    Pull, extract, decompile, and scan an app for secrets
   bun run verify                        Quick connectivity check
 `);
 }
@@ -495,6 +496,8 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch(error => {
-  fail(error instanceof Error ? error.message : String(error));
-});
+if (import.meta.main) {
+  main().catch(error => {
+    fail(error instanceof Error ? error.message : String(error));
+  });
+}

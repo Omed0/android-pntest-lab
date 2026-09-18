@@ -8,6 +8,7 @@ import { DEFAULTS, loadConfig } from "./config.ts";
 import { findAdb } from "./adb.ts";
 import { log, fail } from "./log.ts";
 import { run } from "./exec.ts";
+import { packageApkPaths as sharedPackageApkPaths, packageInstalled as sharedPackageInstalled, pullApk as sharedPullApk } from "./apkpull.ts";
 
 interface TransferOptions {
   package?: string;
@@ -94,15 +95,11 @@ function assertDevice(adbPath: string, serial: string, label: string): void {
 }
 
 function packageApkPaths(adbPath: string, serial: string, pkg: string): string[] {
-  const result = adb(adbPath, serial, "shell", "pm", "path", pkg);
-  if (!result.ok) return [];
-  return result.stdout.split(/\r?\n/)
-    .map(line => line.trim().replace(/^package:/, ""))
-    .filter(path => path.endsWith(".apk"));
+  return sharedPackageApkPaths((...args) => adb(adbPath, serial, ...args), pkg);
 }
 
 function packageInstalled(adbPath: string, serial: string, pkg: string): boolean {
-  return packageApkPaths(adbPath, serial, pkg).length > 0;
+  return sharedPackageInstalled((...args) => adb(adbPath, serial, ...args), pkg);
 }
 
 function openPlayStore(adbPath: string, serial: string, pkg: string): void {
@@ -128,15 +125,7 @@ function waitForInstallation(adbPath: string, serial: string, pkg: string, timeo
 }
 
 function pullApk(adbPath: string, serial: string, remotePath: string, localPath: string): void {
-  const result = adb(adbPath, serial, "pull", remotePath, localPath);
-  if (result.ok) return;
-  const staged = `/sdcard/.android-pentest-lab-${basename(remotePath)}`;
-  const stage = adb(adbPath, serial, "shell", "su", "-c",
-    `cp '${remotePath.replace(/'/g, "'\\''")}' '${staged}'`);
-  if (!stage.ok) throw new Error(`Could not pull ${remotePath}: ${result.stderr.trim() || stage.stderr.trim()}`);
-  const stagedPull = adb(adbPath, serial, "pull", staged, localPath);
-  adb(adbPath, serial, "shell", "rm", "-f", staged);
-  if (!stagedPull.ok) throw new Error(`Could not pull staged APK ${remotePath}: ${stagedPull.stderr.trim()}`);
+  sharedPullApk((...args) => adb(adbPath, serial, ...args), remotePath, localPath);
 }
 
 function installApks(adbPath: string, serial: string, paths: string[]): void {
@@ -193,7 +182,9 @@ async function main(): Promise<void> {
   log.good(`Installed ${pkg} on ${options.targetSerial}.`);
 }
 
-main().catch(error => {
-  log.blank();
-  fail(error instanceof Error ? error.message : String(error));
-});
+if (import.meta.main) {
+  main().catch(error => {
+    log.blank();
+    fail(error instanceof Error ? error.message : String(error));
+  });
+}

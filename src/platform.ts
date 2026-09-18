@@ -27,8 +27,7 @@ export interface PlatformInfo {
 
 export function detectPlatform(): PlatformInfo {
   if (process.platform === "win32") return buildWindows();
-  const wsl = probeWsl();
-  if (wsl) return buildWsl(wsl);
+  if (isRunningInWsl()) return buildWsl(resolveWindowsHome());
   if (process.platform === "darwin") return buildMacos();
   return buildLinux();
 }
@@ -64,7 +63,7 @@ function buildWindows(): PlatformInfo {
   };
 }
 
-function buildWsl(windowsHome: string): PlatformInfo {
+function buildWsl(windowsHome: string | null): PlatformInfo {
   const home = homedir();
   return {
     type: "wsl",
@@ -73,7 +72,15 @@ function buildWsl(windowsHome: string): PlatformInfo {
     exe: ".exe",
     isWsl: true,
     home,
-    sdkDefaultPath: join(windowsHome, "AppData", "Local", "Android", "Sdk"),
+    // Without a resolved Windows home (stripped/headless WSL with no
+    // cmd.exe interop and an empty/unmounted /mnt/c/Users), there is no
+    // reliable Windows-side path to guess — fall back to the Linux-side
+    // default rather than fabricating a path like /mnt/c/AppData/... that
+    // can never exist. findSdk() in sdk.ts already tries ANDROID_HOME/
+    // ANDROID_SDK_ROOT/--sdk-root before this default anyway.
+    sdkDefaultPath: windowsHome
+      ? join(windowsHome, "AppData", "Local", "Android", "Sdk")
+      : join(home, "Android", "Sdk"),
     windowsHome,
   };
 }
@@ -103,20 +110,23 @@ function buildMacos(): PlatformInfo {
   };
 }
 
-/**
- * Returns the Windows home as a WSL path when running inside WSL,
- * or null when not in WSL.
- */
-function probeWsl(): string | null {
-  if (process.platform !== "linux") return null;
-
+/** True when running inside any WSL distro (WSL1 or WSL2). */
+function isRunningInWsl(): boolean {
+  if (process.platform !== "linux") return false;
   try {
-    const version = readFileSync("/proc/version", "utf8");
-    if (!/microsoft|wsl/i.test(version)) return null;
+    return /microsoft|wsl/i.test(readFileSync("/proc/version", "utf8"));
   } catch {
-    return null;
+    return false;
   }
+}
 
+/**
+ * Best-effort resolution of the Windows home as a WSL path. Returns null
+ * (never a guessed path) when it genuinely can't be determined — the
+ * caller falls back to a Linux-side default rather than trusting a path
+ * that was never actually confirmed to exist.
+ */
+function resolveWindowsHome(): string | null {
   // Try to resolve the Windows home via cmd.exe interop.
   try {
     const result = Bun.spawnSync(["cmd.exe", "/c", "echo %USERPROFILE%"], {
@@ -141,5 +151,5 @@ function probeWsl(): string | null {
     } catch { /* ignore */ }
   }
 
-  return "/mnt/c"; // last-resort — we know it's WSL
+  return null;
 }

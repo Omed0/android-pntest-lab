@@ -112,6 +112,15 @@ export class Adb {
         const tmp = `/mnt/c/Windows/Temp/lab-push-${Date.now()}`;
         run("cp", [src, tmp]);
         src = toWinPath(tmp);
+        try {
+          const r = this.exec("push", src, remotePath);
+          if (!r.ok) throw new Error(`adb push failed: ${r.stderr.trim()}`);
+          return;
+        } finally {
+          // Otherwise every WSL-root push leaves a permanent orphan file
+          // behind in C:\Windows\Temp — confirmed nothing else ever deletes it.
+          run("rm", ["-f", tmp]);
+        }
       }
     }
 

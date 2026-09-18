@@ -57,6 +57,7 @@ customize it.
 - [Using your own existing AVD](#using-your-own-existing-avd-rooted-or-play-store-instead)
 - [Configuration reference](#configuration-reference)
 - [SSL/TLS pinning bypass](#ssltls-pinning-bypass)
+- [APK extraction and sensitive-data scanning](#apk-extraction-and-sensitive-data-scanning)
 - [Project layout](#project-layout)
 - [Troubleshooting](#troubleshooting)
 - [Safety](#safety)
@@ -70,6 +71,7 @@ customize it.
 | `bun run clean` | Delete this lab's AVDs and the entire downloaded `tools/` directory (SDK, cache, Frida binaries, rootAVD toolkit), so the next `init` is a genuine from-scratch rebuild. Never touches your APKs, `cert/`, or anything outside what this lab manages. |
 | `bun run transfer -- --package=<pkg>` | Pull a complete installed package (base + split APKs) from the Play Store source to the rooted target. `run` calls this automatically when an app isn't on the target yet. |
 | `bun run apkinfo -- --apk=<path>` | Read a package name/version/launch-activity out of an APK without installing it. `--quiet` prints only the package name (for scripting). |
+| `bun run extract -- --package=<pkg>` | Pull an app's APK(s), extract + (optionally) decompile them, scan for hardcoded secrets, and detect its SSL-pinning technique(s). Writes `testing/<pkg>/REPORT.md`. |
 | `bun run verify` | Read-only health check: host Frida, ADB, boot state, root, `frida-server`, Frida connectivity, proxy setting. |
 
 Every command supports `--help` for its full flag list (`bun run init -- --help`, `bun run run -- --help`, etc.)
@@ -360,6 +362,72 @@ use it for app-logic hooks unrelated to pinning. `--no-unpinning` skips the
 suite entirely and falls back to `--frida-script` alone (or
 `scripts/hook.js`, a minimal placeholder, if neither is given).
 
+## APK extraction and sensitive-data scanning
+
+`bun run extract` formalizes an investigative flow this project used once by
+hand (see `testing/tarik-e2e/` for the original manual run) into a repeatable
+command: pull an app's APK(s), extract them, optionally decompile with
+[jadx](https://github.com/skylot/jadx), scan everything for hardcoded
+secrets, and detect which SSL-pinning technique(s) it uses — one report, one
+command.
+
+```powershell
+bun run extract -- --package=com.example.app          # pull from the target
+bun run extract -- --package=com.example.app --device=source
+bun run extract -- --apk=.\apk\target.apk              # no device needed
+bun run extract -- --package=com.example.app --no-scan # just pull + extract
+```
+
+Output lands under `testing/<pkg>/` (already git-ignored, same as the
+`tarik-e2e` example) — override with `--out=<dir>`:
+
+```text
+testing/<pkg>/
+  pulled_apks/   Raw APK split(s), as found on the device (or your --apk copy)
+  extracted/     Unzipped APK contents: manifest, dex, resources, assets
+  decompiled/    Java sources from jadx, if it's on PATH (skip with --no-jadx)
+  REPORT.md      Findings: secrets, pinning detection, next steps
+```
+
+**Secret scanning** (`src/secrets.ts`): every text file is read directly;
+every binary-ish file (`.dex`, `.arsc`, unknown extensions) is scanned with a
+built-in printable-string extractor (ASCII and UTF-16LE, the way Android
+resources/dex actually store text) — no external dependency required.
+Patterns cover private keys, AWS/Google API keys, Slack tokens, JWTs, bearer
+tokens, URLs with embedded credentials, plain URLs, IPv4 addresses (with a
+port when adjacent), emails, and a deliberately broad `generic-credential-like`
+heuristic (`key: "value"` shapes near words like token/secret/password) —
+labeled as a heuristic in the report, not asserted as a confirmed secret.
+Values are reported **in full** — this is a local lab tool and `testing/` is
+already git-ignored.
+
+Note: `res/**/*.xml` and `AndroidManifest.xml` inside a raw-extracted APK are
+compiled binary AXML, not text — they're scanned via the same
+printable-string extractor as other binaries, not read as UTF-8 (an earlier
+version of this feature did that and produced garbage matches full of
+replacement characters).
+
+**Pinning detection** (`src/unpinning.ts`'s `detectPinningSignatures()`):
+scans `classes*.dex` for known pinning-library fingerprints (OkHttp
+`CertificatePinner`, TrustKit, Appmattus, Flutter pinning plugins, custom
+`X509TrustManager` implementations) and checks for a Network Security Config
+`<pin-set>`. Each finding is labeled:
+
+| Status | Meaning |
+|---|---|
+| `covered` | The default HTTPToolkit suite (`scripts/unpinning/`) already handles this. |
+| `verify-manually` | Partially handled — capture traffic and confirm it's actually unpinned. |
+| `needs-custom` | Not generically coverable. |
+
+For every `needs-custom` finding, `extract` generates a starter hook at
+`scripts/custom/<pkg>.js` (with `TODO`s naming the exact library/class
+found) **unless that file already exists** — it never overwrites a hand
+edit. This is what makes pinning bypass "dynamic": which hooks get
+suggested depends on what's actually found in that specific APK, not a
+fixed list applied to every app. The generated file is picked up
+automatically the next time you run `bun run.ts --package=<pkg>` (same
+auto-load mechanism described above).
+
 ## Project layout
 
 ```text
@@ -374,7 +442,11 @@ android-pentest-lab/
     lab.ts                 init/clean orchestration and CLI
     transfer.ts            Split APK transfer (source -> target)
     apkinfo.ts             Read an APK's package name/version without installing
-    unpinning.ts           Builds the HTTPToolkit script chain + generates its config
+    apkpull.ts             Shared "find + pull installed APK(s)" logic (transfer/run/extract)
+    secrets.ts             Secret-pattern library + printable-string extractor
+    extract.ts             Pull/extract/decompile/scan an app, write REPORT.md
+    unpinning.ts           Builds the HTTPToolkit script chain, generates its config,
+                            detects pinning techniques and generates custom hook stubs
     interactive.ts         Wait-and-poll helper for genuinely manual steps (e.g. Magisk grant)
     adb.ts                 Serial-aware ADB wrapper, root detection, CA install
     avd.ts                 AVD creation, GPU config, identity repair, window lock/raise, launch
@@ -389,6 +461,7 @@ android-pentest-lab/
     sdk.ts                 SDK discovery and installation
   cert/README.md           Proxy CA instructions
   apk/                     Optional local APKs, ignored by Git
+  testing/                 `extract`'s output (testing/<pkg>/), ignored by Git
   tools/                   Caches and local SDK, ignored by Git
 ```
 
