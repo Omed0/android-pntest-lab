@@ -192,6 +192,12 @@ export async function bootstrapLab(labRoot: string, argv: string[] = process.arg
 
   try {
     adb.waitForBoot(cfg.emulatorBootTimeoutSec);
+    // Raise it as soon as it's actually up, not just once at the very end of
+    // bootstrapLab() — the root/Frida/proxy steps below can take minutes
+    // (Magisk patching especially), and the user wants the window visible
+    // throughout that whole process, not just buried until everything
+    // finishes.
+    if (weStartedIt && cfg.showWindow) bringEmulatorWindowToFront(cfg.avdName);
   } catch (error) {
     // A boot timeout right after we launched the emulator ourselves is
     // consistent with a GPU-init failure (black screen) rather than a slow
@@ -207,6 +213,10 @@ export async function bootstrapLab(labRoot: string, argv: string[] = process.arg
     await startEmulator(cfg, platform, "swiftshader_indirect");
     Bun.sleepSync(2_000);
     adb.waitForBoot(cfg.emulatorBootTimeoutSec);
+    // Fresh process from the kill+relaunch above — raise it now rather than
+    // waiting for the single end-of-bootstrap raise, the same reasoning as
+    // the Magisk cold-reboot relaunch below.
+    if (cfg.showWindow) bringEmulatorWindowToFront(cfg.avdName);
   }
 
   // Sanity-check the display renderer (warn only). The real black-screen
@@ -269,7 +279,13 @@ export async function bootstrapLab(labRoot: string, argv: string[] = process.arg
   log.good(`LAB READY: ${cfg.avdName} / Android ${adb.getAndroidVersion()} / Frida ${fridaVersion}`);
   // Raise + maximize the emulator window as the very last action, so none of
   // the root/frida/adb steps above (which steal focus) leave it buried.
-  if (weStartedIt && cfg.showWindow) bringEmulatorWindowToFront(cfg.avdName);
+  // Deliberately NOT gated on weStartedIt: ensureMagiskRoot() (or the
+  // GPU-retry path above) can kill+relaunch the emulator process even when
+  // this run didn't originally launch it (weStartedIt=false because it was
+  // already connected before bootstrapLab() started) — that relaunched
+  // window still needs raising, and re-raising an emulator we didn't launch
+  // at all is harmless (it's this lab's own device either way).
+  if (cfg.showWindow) bringEmulatorWindowToFront(cfg.avdName);
 }
 
 export async function initializeLab(labRoot: string, argv: string[]): Promise<void> {

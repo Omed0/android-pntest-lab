@@ -25,7 +25,7 @@ import { dirname, join, relative } from "path";
 import { log } from "./log.ts";
 import { runWithStdin } from "./exec.ts";
 import { downloadFile, extractZipFlattenRoot } from "./download.ts";
-import { killEmulator, startEmulator } from "./avd.ts";
+import { killEmulator, startEmulator, bringEmulatorWindowToFront } from "./avd.ts";
 import { waitForManualStep } from "./interactive.ts";
 import type { LabConfig } from "./config.ts";
 import type { PlatformInfo } from "./platform.ts";
@@ -236,6 +236,13 @@ export async function ensureMagiskRoot(cfg: LabConfig, platform: PlatformInfo, a
     log.info("Cold-booting the AVD to apply the Magisk-patched ramdisk…");
     await startEmulator(cfg, platform);
     adb.waitForBoot(cfg.emulatorBootTimeoutSec);
+    // This kill+relaunch happens deep inside bootstrapLab(), well before its
+    // own final bringEmulatorWindowToFront() call — and the very next step
+    // asks the user to go tap something inside this exact window. Without
+    // raising it here, the window sits wherever Windows placed the brand-new
+    // process (often behind the terminal or minimized), and the "open the
+    // Magisk app" instructions below point at a window nobody can see.
+    if (cfg.showWindow) bringEmulatorWindowToFront(cfg.avdName);
 
     // Verify uid=0 is reachable via `su` SPECIFICALLY (not just adb-root,
     // which was already true before this ever ran) — this is the actual
