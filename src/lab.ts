@@ -2,7 +2,7 @@ import { existsSync } from "fs";
 import { rmSync } from "fs";
 import { run, runLive } from "./exec.ts";
 import { detectPlatform } from "./platform.ts";
-import { applyGpuConfig, bringEmulatorWindowToFront, ensureAvd, killEmulator, launchWindowsEmulator, listAvds, lockEmulatorWindow, resolveDeviceProfile, startEmulator } from "./avd.ts";
+import { applyGpuConfig, bringEmulatorWindowToFront, ensureAvd, killEmulator, launchWindowsEmulator, listAvds, lockEmulatorWindow, repairAvdIdentity, resolveDeviceProfile, startEmulator } from "./avd.ts";
 import { avdmanagerPath, emulatorPath, ensureSdk, sdkmanagerPath } from "./sdk.ts";
 import { Adb, findAdb } from "./adb.ts";
 import { DEFAULTS, loadConfig, printConfig } from "./config.ts";
@@ -150,6 +150,16 @@ async function ensureSourceAvd(
   if (!created.ok && !created.stdout.includes("created")) {
     throw new Error(`Could not create source AVD:\n${created.stderr.trim() || created.stdout.trim()}`);
   }
+  // See repairAvdIdentity()'s doc comment in src/avd.ts: this project's
+  // auto-installed avdmanager can't parse a decimal API level (e.g. the
+  // "37.0" this source image reports) and leaves unresolved template
+  // placeholders in the new AVD's files instead of real values — the
+  // actual, confirmed root cause of a boot-loop that looked like a
+  // GPU/graphics problem but wasn't. Parse the integer API level straight
+  // out of the requested image package string (e.g. "37" from
+  // "system-images;android-37.0;google_apis_playstore;x86_64") and repair.
+  const apiLevelMatch = imagePackage.match(/android-(\d+)/);
+  if (apiLevelMatch) repairAvdIdentity(avdName, parseInt(apiLevelMatch[1], 10));
   log.good(`Source AVD ready: ${avdName}`);
   return true;
 }

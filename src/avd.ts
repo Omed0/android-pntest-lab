@@ -153,6 +153,12 @@ export async function ensureAvd(
     throw new Error(`avdmanager failed:\n${r.stderr.trim() || r.stdout.trim()}`);
   }
 
+  // Defensive: cfg.apiLevel is always a plain integer for the target today,
+  // so this is a no-op in practice, but costs nothing and future-proofs the
+  // target path against the same avdmanager decimal-API-level bug
+  // documented in repairAvdIdentity()'s doc comment, should a future
+  // preview image ever be used here too.
+  repairAvdIdentity(cfg.avdName, cfg.apiLevel);
   log.good(`AVD created: ${cfg.avdName}`);
   applyHardwareConfig(cfg);
   lockEmulatorWindow(cfg, cfg.avdName, platform);
@@ -249,6 +255,91 @@ export function applyGpuConfig(avdName: string): void {
   setKey("hw.keyboard",    "yes");
   writeFileSync(configFile, ini, "utf8");
   log.good(`GPU + host keyboard enabled for AVD: ${avdName}`);
+}
+
+/**
+ * Repair broken, unresolved template placeholders that `avdmanager create
+ * avd` (the older cmdline-tools build this project auto-installs) leaves
+ * behind when a system image reports a DECIMAL API level in its
+ * source.properties (e.g. `AndroidVersion.ApiLevel=37.0`, confirmed
+ * directly on a `google_apis_playstore` android-37.0 image) — this older
+ * avdmanager can't parse the fractional value and falls through to writing
+ * its own unresolved template tokens instead of real values:
+ *   - the AVD's sibling `<name>.ini` pointer file: `target=android-0`
+ *     (a real target is never API 0)
+ *   - `config.ini`: `avd.id=<build>`, `avd.name=<build>` (literal,
+ *     unresolved), `disk.dataPartition.path=<temp>` (also literal —
+ *     confirmed a normal working AVD's config.ini has no such key at all)
+ *
+ * This partial AVD identity is what was actually causing an observed
+ * boot-loop (Google logo -> brief "pending" screen -> back to logo,
+ * forever) on a freshly-created Pixel_10_Pro AVD — NOT a GPU/graphics
+ * problem. Confirmed directly: opening the SAME AVD in Android Studio's
+ * newer AVD Manager (which correctly parses "37.0") and clicking
+ * "Edit -> Finish" with no changes silently rewrites these exact fields
+ * to real values, after which the identical AVD boots cleanly both from
+ * Studio's own Play button and from this project's own launch path — the
+ * fix lives entirely in the on-disk AVD files, not in anything Studio
+ * runs differently. This function does the same repair programmatically
+ * so no manual Studio step is ever needed.
+ *
+ * Detection is generic (scans for the marker strings/values above, not
+ * hardcoded to any one AVD name) so it transparently covers any future
+ * image that hits the same avdmanager limitation. Safe/no-op to call on
+ * an already-correct AVD (e.g. the target's normal integer API levels
+ * never trigger this bug) or to call repeatedly.
+ *
+ * @param apiLevel  The real intended integer API level (parsed by the
+ *   caller from the requested system-image package string, e.g. "37" from
+ *   "system-images;android-37.0;google_apis_playstore;x86_64").
+ */
+export function repairAvdIdentity(avdName: string, apiLevel: number): void {
+  const avdHome = avdHomeDir(avdName);
+  const iniPath = join(avdHome, "..", `${avdName}.ini`);
+  const configPath = join(avdHome, "config.ini");
+
+  if (existsSync(iniPath)) {
+    let pointerIni = readFileSync(iniPath, "utf8");
+    if (/^target=android-0$/m.test(pointerIni)) {
+      pointerIni = pointerIni.replace(/^target=android-0$/m, `target=android-${apiLevel}`);
+      writeFileSync(iniPath, pointerIni, "utf8");
+      log.good(`Repaired unresolved AVD target (was android-0) -> android-${apiLevel}: ${avdName}`);
+    }
+  }
+
+  if (!existsSync(configPath)) return;
+  let ini = readFileSync(configPath, "utf8");
+  let repaired = false;
+
+  const fixLiteral = (key: string, placeholder: string, value: string) => {
+    const re = new RegExp(`^${key}=${placeholder}$`, "m");
+    if (re.test(ini)) { ini = ini.replace(re, `${key}=${value}`); repaired = true; }
+  };
+  fixLiteral("avd\\.id", "<build>", avdName);
+  fixLiteral("avd\\.name", "<build>", avdName);
+
+  // Any line whose value is the literal unresolved token is deleted
+  // outright rather than replaced with a guessed path — a normal working
+  // AVD doesn't set disk.dataPartition.path at all, letting the emulator
+  // fall back to its own default.
+  const tempLineRe = /^[^\n=]+=<temp>$\n?/m;
+  if (tempLineRe.test(ini)) { ini = ini.replace(tempLineRe, ""); repaired = true; }
+
+  const setKeyIfMissing = (key: string, value: string) => {
+    if (!new RegExp(`^${key}=`, "m").test(ini)) { ini += `\n${key}=${value}`; repaired = true; }
+  };
+  setKeyIfMissing("AvdId", avdName);
+  setKeyIfMissing("avd.ini.displayname", avdName);
+
+  if (/tag\.id=.*playstore/.test(ini) && /^PlayStore\.enabled=no$/m.test(ini)) {
+    ini = ini.replace(/^PlayStore\.enabled=no$/m, "PlayStore.enabled=yes");
+    repaired = true;
+  }
+
+  if (repaired) {
+    writeFileSync(configPath, ini, "utf8");
+    log.good(`Repaired unresolved avdmanager template placeholders in config.ini: ${avdName}`);
+  }
 }
 
 /**

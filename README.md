@@ -17,6 +17,24 @@ bun install
 bun run init -- --install-sdk     # downloads/installs everything, boots both emulators
 ```
 
+The very first run on a brand-new AVD needs **one manual step**: Magisk
+requires a human to approve its first superuser grant (Android's own
+security model — no script can fake this without defeating the point of
+it). `init` doesn't fail when it hits this — it prints exactly what to do
+and waits, picking up automatically the moment you do it:
+
+```
+[!] Manual step needed — this will keep waiting and continue automatically once it's done:
+  Open the Magisk app inside the emulator window.
+  Go to Settings and set Superuser access to auto-grant (not "Prompt") for ADB/shell requests.
+  This will notice automatically once granted and continue — no need to rerun anything.
+```
+
+Do that once in the emulator window and the same `init` run continues on
+its own through Frida/proxy/cert setup to `LAB READY` — no rerun needed.
+Every subsequent `init`/`clean`+`init` on the same AVD skips this (Magisk's
+grant persists on the device).
+
 Start Burp (or your proxy of choice), then:
 
 ```powershell
@@ -33,7 +51,7 @@ customize it.
 - [Architecture](#architecture)
 - [Requirements](#requirements)
 - [Emulator display: GPU and window](#emulator-display-gpu-and-window)
-- [Root: two kinds, handled automatically](#root-two-kinds-handled-automatically)
+- [Root: Play Store + Magisk by default](#root-play-store--magisk-by-default)
 - [Proxy and certificates](#proxy-and-certificates-burp-by-default--any-other-tool-also-works)
 - [Portable mode](#portable-mode-no-system-wide-installs-at-all)
 - [Using your own existing AVD](#using-your-own-existing-avd-rooted-or-play-store-instead)
@@ -47,9 +65,9 @@ customize it.
 
 | Command | What it does |
 |---|---|
-| `bun run init -- --install-sdk` | Download/install everything needed (Java, SDK, Frida), create + boot both emulator roles, verify root, deploy Frida, set the device proxy and install its CA. Safe to rerun — skips anything already in place. |
-| `bun run run -- --package=<pkg>` | Install or recover an app, re-confirm the proxy (Burp by default) and its CA, launch the app, attach Frida. |
-| `bun run clean` | Delete this lab's AVDs and the entire downloaded `tools/` directory (SDK, cache, Frida binaries), so the next `init` is a genuine from-scratch rebuild. Never touches your APKs, `cert/`, or anything outside what this lab manages. |
+| `bun run init -- --install-sdk` | Download/install everything needed (Java, SDK, Frida), create + boot both emulator roles, root the target (Play Store + Magisk by default — waits for the one-time grant on a fresh AVD instead of failing), deploy Frida, set the device proxy and install its CA. Safe to rerun — skips anything already in place. |
+| `bun run run -- --package=<pkg>` | Install or recover an app, re-confirm the proxy (Burp by default) and its CA, launch the app, attach Frida with the unpinning suite. |
+| `bun run clean` | Delete this lab's AVDs and the entire downloaded `tools/` directory (SDK, cache, Frida binaries, rootAVD toolkit), so the next `init` is a genuine from-scratch rebuild. Never touches your APKs, `cert/`, or anything outside what this lab manages. |
 | `bun run transfer -- --package=<pkg>` | Pull a complete installed package (base + split APKs) from the Play Store source to the rooted target. `run` calls this automatically when an app isn't on the target yet. |
 | `bun run apkinfo -- --apk=<path>` | Read a package name/version/launch-activity out of an APK without installing it. `--quiet` prints only the package name (for scripting). |
 | `bun run verify` | Read-only health check: host Frida, ADB, boot state, root, `frida-server`, Frida connectivity, proxy setting. |
@@ -68,22 +86,26 @@ Every command supports `--help` for its full flag list (`bun run init -- --help`
               │                                 │
    ┌──────────▼──────────┐          ┌───────────▼──────────┐
    │  TARGET emulator      │          │  SOURCE emulator      │
-   │  rooted, no Play Store│          │  Play Store enabled   │
+   │  rooted, Play Store   │          │  Play Store enabled,  │
+   │  (Magisk) by default  │          │  never rooted         │
    │  Frida attaches here  │◄─────────┤  app installed here    │
    │  (bun run run)         │ transfer │  (interactive sign-in │
    │                        │          │   + one Install tap)  │
    └────────────────────────┘          └────────────────────────┘
 ```
 
-The two roles are deliberately never the same device: Play Store images are
-locked down by Google (no `adb root`, no Magisk) — install the real app
-there once, then `bun run transfer` (or `run`, which calls it automatically)
-hands the APKs to your separate rooted target for actual testing.
+The **source** is never rooted, on purpose — it exists purely so Play Store
+fully trusts it and will show/install anything, including apps that a
+rooted device gets hidden from or blocked on. Whether the **target** also
+needs to stay separate for a given app is a judgment call — see
+[Root: Play Store + Magisk by default](#root-play-store--magisk-by-default)
+for when a single rooted-and-Play-Store target is enough on its own, and
+when you still want the source + `transfer` path.
 
 | Role | AVD name | Serial | Purpose |
 |---|---|---|---|
-| Target | `$LAB_AVD_NAME` (default `Pixel_7_Pro`) | `$LAB_TARGET_SERIAL` (default `emulator-5554`) | Rooted, Frida-attached test device |
-| Source | `$LAB_SOURCE_AVD` (default `Pixel_10_Pro`) | `$LAB_SOURCE_SERIAL` (default `emulator-5556`) | Play Store app recovery only |
+| Target | `$LAB_AVD_NAME` (default `Pixel_7_Pro`) | `$LAB_TARGET_SERIAL` (default `emulator-5554`) | Rooted, Play Store enabled by default, Frida-attached test device |
+| Source | `$LAB_SOURCE_AVD` (default `Pixel_10_Pro`) | `$LAB_SOURCE_SERIAL` (default `emulator-5556`) | Play Store app recovery only, never rooted |
 
 ## Requirements
 
@@ -102,98 +124,50 @@ Everything else is automated by `bun run init -- --install-sdk`:
 | 7-Zip (Windows) | Auto-installed via `winget`, or a private portable copy with `--portable`. `.zip` extraction falls back to the built-in `Expand-Archive` either way. |
 | Android SDK (cmdline-tools / platform-tools / emulator / system images) | Downloaded and installed by `sdkmanager`, cached under `tools/cache/`. |
 | GPU-enabled AVD config | Every AVD this lab creates gets `hw.gpu.enabled=yes` explicitly written into its `config.ini` — `avdmanager create avd` alone defaults this to `no`, which is what actually causes an all-black/white/grey emulator screen (not a `-gpu` flag problem). |
+| Correct AVD identity | `avdmanager create avd`'s own template substitution breaks on some system images (see [Troubleshooting](#troubleshooting)) — this lab detects and repairs it automatically right after creation, on every AVD. |
 | Android Studio (GUI) | Installed via `winget` as a real, standard app — shows up in Windows search / Start Menu, the deliberate *opposite* of `--portable`'s isolated pattern above. Purely additive: this lab's own AVD/emulator management always uses the headless CLI-managed SDK regardless of whether Studio is installed. Skip with `--no-android-studio`. |
-| Root | Auto-detected per device (see below). Never downloads, installs, or configures Magisk unless you explicitly opt in with `--magisk-root`. |
+| Root | Play Store + real Magisk root by default (see below) — patches the target's ramdisk via rootAVD and waits for the one-time superuser grant on a fresh AVD instead of failing. |
 
 ## Emulator display: GPU and window
 
 **GPU mode** — two independent settings, because the two roles behave differently:
 
 - **Target** (`--gpu-mode`, env `LAB_GPU_MODE`, default `auto`): with GPU explicitly enabled in its AVD config (see table above), `auto` reliably renders on the host GPU.
-- **Source**: launched with **no `-gpu` flag at all** — confirmed directly that this AVD renders correctly when launched exactly like Android Studio's own Device Manager does (no CLI override, `hw.gpu.mode=auto` from its `config.ini` is the only setting in effect); the lab's own earlier custom `-gpu` override on this AVD was the cause of the instability, not the fix for it. The one exception: a **brand-new** source AVD's very first boot has no snapshot yet and must cold-boot the full guest graphics stack, which was confirmed to crash-loop (endless restarting boot animation) under host GPU on at least one machine (AMD integrated GPU + this preview system image) — so that one first-ever cold boot forces `--source-gpu-mode` (env `LAB_SOURCE_GPU_MODE`, default `swiftshader_indirect`) automatically. Every later boot of that same AVD (once a snapshot exists) goes back to the flagless, Device-Manager-matching path. A boot timeout on a non-fresh AVD also retries once with this override.
+- **Source**: launched with **no `-gpu` flag at all** — confirmed directly that this AVD renders correctly when launched exactly like Android Studio's own Device Manager does (no CLI override, `hw.gpu.mode=auto` from its `config.ini` is the only setting in effect); this lab's own earlier custom `-gpu` override on this AVD was the cause of instability, not the fix for it. The one exception: a **brand-new** source AVD's very first boot has no snapshot yet and must cold-boot the full guest graphics stack, which was confirmed to crash-loop (endless restarting boot animation) under host GPU on at least one machine (AMD integrated GPU + this preview system image) — so that one first-ever cold boot forces `--source-gpu-mode` (env `LAB_SOURCE_GPU_MODE`, default `swiftshader_indirect`) automatically. Every later boot of that same AVD (once a snapshot exists) goes back to the flagless, Device-Manager-matching path. A boot timeout on a non-fresh AVD also retries once with this override.
 
 **Window** — visible by default, no bare console window, and sized to actually fit your screen:
 
 - Launches with a real, visible window (`--no-show-window` to hide it), with the terminal/console window it would otherwise also pop up suppressed (`-NoNewWindow`, not just a hidden style — a genuinely different Windows API call).
 - Raised and un-minimized immediately after launch (not just at the end), so you can watch it boot.
 - Position/size are locked read-only (`--no-lock-window` to disable) so the emulator can't silently reset them on shutdown, the way it normally would.
-- **Size is measured, not guessed**: `--window-scale` defaults to `0`, meaning "auto-fit" — at lock time, the lab measures *this machine's actual screen work area* (via .NET's `Screen.WorkingArea`, falling back to raw `GetSystemMetrics` if that API isn't available) and *this AVD's actual device resolution* (`hw.lcd.width`/`hw.lcd.height` from its own `config.ini`), then computes the largest scale that fits both dimensions within ~92% of the screen. If either real measurement fails, `window.scale` is left unset (the emulator's own default) rather than substituting a guessed number — the fit is always live-measured for whatever screen this happens to run on, never a hardcoded constant. Pass an explicit `--window-scale=<n>` (`0 < n <= 1.0`; `1.0` = native size) to override with a literal scale instead.
+- **Size is measured, not guessed**: `--window-scale` defaults to `0`, meaning "auto-fit" — at lock time, the lab measures *this machine's actual screen work area* (via .NET's `Screen.WorkingArea`, falling back to raw `GetSystemMetrics` if that API isn't available) and *this AVD's actual device resolution* (`hw.lcd.width`/`hw.lcd.height` from its own `config.ini`), then computes the largest scale that fits both dimensions within ~92% of the screen. If either real measurement fails, `window.scale` is left unset (the emulator's own default) rather than substituting a guessed number. Pass an explicit `--window-scale=<n>` (`0 < n <= 1.0`; `1.0` = native size) to override with a literal scale instead.
 - The emulator's window enforces its locked scale as a hard *maximum* too — a real Win32 "maximize" call has no effect once a scale is locked, which is exactly why the auto-fit measurement (not an OS maximize call) is what makes the window actually fill the screen for the **target**. The **source** has no scale lock at all, so its window uses a real OS-level maximize instead.
 - **Host keyboard input**: every AVD also gets `hw.keyboard=yes` written into its `config.ini` — `avdmanager create avd` defaults this to `no` for phone profiles, which makes Android expect only the on-screen soft keyboard and ignore host keystrokes entirely. With it enabled, typing on your physical keyboard reaches whatever field is focused in either emulator, same as Android Studio's own AVDs.
 
-## Root: two kinds, handled automatically
+## Root: Play Store + Magisk by default
 
-- **`adb root`-rooted emulators** — the default (`google_apis`, non-Play-Store) target image: a userdebug build where `adb root` alone restarts `adbd` as root, no Magisk needed. `bun run init` tries this first — **zero manual steps** for the default configuration.
-- **Magisk/su-rooted devices** — physical hardware, Play-Store images, or a rootAVD-prepared AVD. Falls back to `su -c '<cmd>'` automatically when `adb root` doesn't grant `uid=0`.
+The **target** defaults to a Play Store system image (`--system-image-tag`, default `google_apis_playstore`) rooted with real Magisk (`--magisk-root`, default **on**) — one device with both Play Services present and genuine root, confirmed working end to end. `verifyRoot()` tries `adb shell id` → `adb root` → `su -c id` in order; a Play Store image can't use plain `adb root` at all (blocked by Google), so Magisk is what actually grants root there.
 
-`verifyRoot()` tries `adb shell id` → `adb root` → `su -c id` in order and uses whichever succeeds; every later root-only command reuses that same mode.
+**The one-time manual step** (see [Quick start](#quick-start)): a fresh Magisk patch needs a human to approve its first `su` grant — there's no UI to tap for a headless `adb shell su` call, so Magisk's own access policy denies it by default (`Permission denied`, even though the patch and `magiskd` are both genuinely fine — confirmed directly: `magiskd` running as root, the Magisk app installed, at the exact moment it denies). `init` doesn't fail on this — it prints the fix and waits (polling every few seconds, with periodic reminders, for up to 15 minutes by default), continuing automatically the moment you grant it in the Magisk app. This is a one-time cost per fresh AVD; the grant persists across `init` reruns on the same AVD.
 
-**Does this lab download/install Magisk?** By default, no — it only *detects*
-whichever root kind is already present; `adb root` on the default system
-image is all it needs. Pass `--magisk-root` and it does: see below.
+**Lighter alternative**: `--system-image-tag=google_apis --no-magisk-root` skips Play Store and Magisk entirely — a plain userdebug image where `adb root` alone grants root, no manual step, no ramdisk patch, faster boot. Use this if an app under test doesn't need Play Services at all.
 
-### Optional: real Magisk on the target (`--magisk-root`)
+**`--magisk-root` only ever applies to the target**, never the Play Store **source** — the source stays intentionally unrooted per the architecture above; that's not something this flag changes.
 
-`adb root` gives every root-only feature this lab uses (Frida, cert install)
-a `uid=0` shell — but some apps under test check for root a different way:
-looking for the `su` binary specifically, or for the Magisk app package
-itself, rather than just checking `id`. `adb root` alone doesn't fool that
-kind of check, because there's no real `su`/Magisk installed underneath it.
+The patch step is idempotent (rerunning `--magisk-root` detects an already-Magisk-rooted device and skips straight past it) and non-fatal on genuine failure (a truly broken patch — not the grant-policy wait above — logs a clear warning and falls back to plain adb-root, rather than aborting the whole lab setup, on an image where that fallback is possible).
 
-Pass `--magisk-root` and the target AVD's ramdisk gets patched with real
-Magisk via [rootAVD](https://github.com/newbit1/rootAVD) — automatically
-downloaded, extracted, and driven through its (otherwise interactive) menu.
-This is **opt-in and off by default** because it's a meaningfully heavier,
-slower, and riskier operation than everything else this project does
-automatically: it patches the AVD's ramdisk image on disk and requires a
-full emulator kill+relaunch (not just an `adb reboot`) to take effect. Only
-reach for it if you actually need to defeat `su`/Magisk-specific detection;
-for everything else, the default `adb root` path is faster and simpler.
+### When one rooted+Play-Store device is enough, and when it isn't
 
-`--magisk-root` only ever applies to the rooted **target** AVD, never the
-Play Store **source** — the source stays intentionally locked down (no `adb
-root`, no Magisk) per the two-roles architecture described above.
-
-**One-time manual step, confirmed live**: after a fresh patch, `su -c id`
-can come back `Permission denied` even though the patch and `magiskd` are
-both genuinely fine — that's Magisk's own su *access policy* denying a
-headless request because there's no human to tap "Grant" on the usual
-prompt. Fix once per AVD: open the Magisk app inside the emulator window
-and set Superuser access to auto-grant (not prompt) for ADB/shell requests.
-`bun run init -- --magisk-root` picks this up immediately on the next run —
-no repatch needed. The error message distinguishes this case from a
-genuinely failed patch (empty `su -c id` output) automatically.
-
-The patch step is idempotent — rerunning `bun run init -- --magisk-root`
-detects an already-Magisk-rooted device and skips straight past it — and
-non-fatal on failure: if rootAVD's patch doesn't succeed, bootstrap logs a
-clear warning and continues with plain adb-root, rather than aborting the
-whole lab setup.
-
-### Play Store *and* root on the same device
-
-Combine `--system-image-tag=google_apis_playstore` with `--magisk-root` on
-the **target** itself (not the source) to get one device with both Play
-Store and real root — confirmed working end to end. Useful when an app only
-needs Play Services to *be present* (not full Play Integrity attestation):
-sign into Play Store directly on the rooted target, install the app there,
-and skip `transfer.ts`/the source device entirely for that app.
-
-This doesn't replace the two-role architecture — it's a per-app choice:
+The default single-target setup works great for apps that only need Play Services to *be present*. It doesn't replace the source/`transfer` workflow for apps that enforce **Play Integrity**/device certification strictly — Play Store itself hides or blocks installs on a rooted/Magisk device for those, regardless of any hiding trick a script could apply:
 
 | App's requirement | Use |
 |---|---|
-| Just needs Play Services present, no strict device-integrity checks | Single rooted target with `--system-image-tag=google_apis_playstore --magisk-root` — sign in and install directly. |
-| Enforces Play Integrity / device certification strictly (common for banking, DRM/streaming apps) | Keep the default two-role setup — Play Store on a rooted/Magisk device often won't show or install these at all, regardless of hiding tricks. Install on the clean **source**, then `bun run transfer` to the rooted **target**. |
+| Just needs Play Services present, no strict device-integrity checks | The default target as-is — sign into Play Store directly on it, install the app there. |
+| Enforces Play Integrity / device certification strictly (common for banking, DRM/streaming apps) | Install on the clean, unrooted **source**, then `bun run transfer` to the rooted **target** — Play Store on the rooted device often won't cooperate at all for these. |
 
-If you're not sure which an app needs, try the single-device path first —
-it's simpler — and fall back to the source/transfer workflow if Play Store
-won't cooperate.
+If you're not sure which an app needs, try installing directly on the target first — it's simpler — and fall back to `transfer` if Play Store won't cooperate there.
 
-An existing target AVD is **not** automatically converted — `bun run init`
-reuses an existing AVD by name as-is, ignoring `--system-image-tag` unless
-you also pass `--force-avd` (which deletes and recreates it from scratch,
-losing whatever was installed on it).
+An existing target AVD is **not** automatically converted — `bun run init` reuses an existing AVD by name as-is, ignoring `--system-image-tag`/`--magisk-root` unless you also pass `--force-avd` (which deletes and recreates it from scratch, losing whatever was installed on it).
 
 ## Proxy and certificates (Burp by default — any other tool also works)
 
@@ -209,8 +183,10 @@ device restart, or to point one run at a different proxy/host/port).
 the lab requests Burp's CA through `http://burp/cert` and saves it as
 `cert/burp-ca.cer`. The CA is installed into the target's system trust store
 via a **tmpfs overlay** on `/system/etc/security/cacerts` — just `adb root`,
-no `-writable-system`, no dm-verity disable, no reboot. Already-installed
-certs are detected and skipped on rerun.
+no `-writable-system`, no dm-verity disable, no reboot — and also pushed to
+`/data/local/tmp/cert-der.crt`, the fixed path several unpinning techniques
+(including the vendored suite below) expect. Already-installed certs are
+detected and skipped on rerun.
 
 **A different proxy tool** (mitmproxy, etc.): pass `--proxy-tool=other` (skips
 the Burp-only auto-download), `--proxy-host`/`--proxy-port` for your
@@ -224,6 +200,8 @@ bun run run -- --package=<pkg> --proxy-tool=other --proxy-host=10.0.2.2 --proxy-
 **No proxy at all:** `--no-proxy` (alias `--no-burp`) skips proxy/cert setup —
 pass it to `init` to skip it there, and/or to `run` to skip it there too;
 they're independent.
+
+**Clearing the proxy:** `bun run init -- --clear-proxy` (or `bun run run -- --clear-proxy`) resolves the target/proxy settings from the same config as everything else and clears the device's proxy — no hand-written `adb` commands needed. It's a standalone action; no other setup steps run alongside it.
 
 If the certificate isn't ready yet (Burp not running, no file under `cert/`),
 `init` warns and continues rather than aborting the whole setup — root,
@@ -288,9 +266,7 @@ are explicitly labeled "Pre-Release" experimental images in `sdkmanager
 one test machine (DMA-readback assertion crashes on `screencap`, Windows
 "device attached to the system is not functioning" display errors, and
 unreliable boots). This project's own default source image was fixed to a
-standard, non-`_ps16k` image for exactly this reason — don't override
-`--source-image-package` back to a `_ps16k` variant unless you specifically
-need 16 KB page size testing and have verified it's stable on your machine.
+standard, non-`_ps16k` image for exactly this reason.
 
 ## Configuration reference
 
@@ -299,24 +275,27 @@ Priority: **CLI flag** > **environment variable** > **built-in default**.
 ```text
 LAB_TARGET_SERIAL         Rooted target ADB serial              [emulator-5554]
 LAB_AVD_NAME              Target AVD name                       [Pixel_7_Pro]
+LAB_API_LEVEL             Target Android API level              [33]
+LAB_ABI                   CPU ABI                                [x86_64]
+LAB_SYSTEM_IMAGE_TAG      Target system-image tag                [google_apis_playstore]
 LAB_SOURCE_SERIAL         Play Store source ADB serial          [emulator-5556]
 LAB_SOURCE_AVD            Play Store source AVD name            [Pixel_10_Pro]
 LAB_SOURCE_IMAGE_PACKAGE  Play Store source system image         [android-37.0, google_apis_playstore, no ps16k]
 LAB_SOURCE_DEVICE_PROFILE Preferred source device profile       [pixel_7_pro]
 LAB_SDK_ROOT              Android SDK root                      [auto-detect]
-LAB_API_LEVEL             Target Android API level              [33]
-LAB_ABI                   CPU ABI                                [x86_64]
 LAB_FRIDA_VERSION         Frida version                          ["auto" = match host]
 LAB_PROXY_HOST/PORT       Proxy endpoint (Burp by default)       [10.0.2.2:8080]
 LAB_BURP_HOST/PORT        Older aliases for the above, still work
 LAB_GPU_MODE              Target emulator -gpu mode              [auto]
-LAB_SOURCE_GPU_MODE       Source emulator -gpu mode               [swiftshader_indirect]
+LAB_SOURCE_GPU_MODE       Source emulator first-cold-boot -gpu mode [swiftshader_indirect]
 LAB_WINDOW_SCALE          Emulator window scale                  [0 = auto-fit screen]
 LAB_PORTABLE              1 = download deps into tools/ only, never the host's own
 ```
 
-Run `bun run init -- --help` for the complete flag list (AVD sizing, boot
-timeout, window position, SDK paths, `--magisk-root`, and more).
+`--magisk-root` and `--android-studio` are on by default and are CLI-only
+booleans (`--no-magisk-root`, `--no-android-studio`) — no `LAB_*` env
+equivalent. Run `bun run init -- --help` for the complete flag list (AVD
+sizing, boot timeout, window position, SDK paths, and more).
 
 Example for a different workstation:
 
@@ -336,9 +315,9 @@ bun run run -- --package=com.example.authorized
 
 `bun run run` loads the [HTTPToolkit unpinning
 suite](https://github.com/httptoolkit/frida-interception-and-unpinning)
-(vendored under `scripts/unpinning/`) **automatically, by default** — no
-flag needed. It covers far more real apps than a single hand-written script
-can:
+(vendored under `scripts/unpinning/`, AGPL-3.0-or-later — see its own
+`LICENSE`/`README.md`) **automatically, by default** — no flag needed. It
+covers far more real apps than a single hand-written script can:
 
 | Script | What it covers |
 |---|---|
@@ -348,12 +327,13 @@ can:
 | `android-system-certificate-injection.js` | Native-level system trust store injection (complements, doesn't replace, the tmpfs overlay `run`/`init` already install). |
 | `android-certificate-unpinning.js` | OkHttp, TrustKit, Appmattus, and other named pinning libraries. |
 | `android-certificate-unpinning-fallback.js` | **Auto-detects and patches unrecognized pinning failures on the fly**, and when it genuinely can't, prints a loud, unmissable alert — see below. |
-| `android-disable-root-detection.js` | Common root/Magisk detection checks (file existence, `su`, system properties). |
+| `android-disable-root-detection.js` | Common root/Magisk detection checks (file existence, `su`, system properties) — genuinely relevant now that the target is really Magisk-rooted by default. |
 | `android-disable-flutter-certificate-pinning.js` | Flutter's own bundled TLS stack, which ignores the system trust store and most Java-level hooks entirely. |
 
 `bun run run` generates a fresh `scripts/unpinning/config.generated.js` on
 every run (gitignored) from your live `--proxy-host`/`--proxy-port` and the
-currently-installed proxy CA — no manual editing of `config.js` needed.
+currently-installed proxy CA, substituted into the real vendored `config.js`
+template — no manual editing needed.
 
 **If it can't bypass something**: the fallback layer prints this to the
 Frida console when a pinning failure isn't one of the patterns it
@@ -395,9 +375,10 @@ android-pentest-lab/
     transfer.ts            Split APK transfer (source -> target)
     apkinfo.ts             Read an APK's package name/version without installing
     unpinning.ts           Builds the HTTPToolkit script chain + generates its config
+    interactive.ts         Wait-and-poll helper for genuinely manual steps (e.g. Magisk grant)
     adb.ts                 Serial-aware ADB wrapper, root detection, CA install
-    avd.ts                 AVD creation, GPU config, window lock/raise, launch
-    magisk.ts              Optional real Magisk root via rootAVD (--magisk-root)
+    avd.ts                 AVD creation, GPU config, identity repair, window lock/raise, launch
+    magisk.ts              Real Magisk root via rootAVD (--magisk-root, on by default)
     proxy.ts               Device proxy + CA cert install/clear (shared by init and run)
     config.ts              Defaults, flags, and LAB_* variables
     download.ts            Download/extraction helpers, Java/7-Zip bootstrap
@@ -418,7 +399,26 @@ android-pentest-lab/
 The cause was `hw.gpu.enabled=no` in the AVD's `config.ini` — fixed for every
 AVD this lab creates (see [Requirements](#requirements)). If you still see it
 on the target, try `--gpu-mode=swiftshader_indirect`. The source already
-defaults to software rendering.
+defaults to software rendering on its first cold boot.
+
+**Source AVD boot-loops (Google logo → briefly loads → back to logo, forever)**
+
+Historical cause, now fixed automatically: `avdmanager create avd` (the
+older cmdline-tools build this project auto-installs) can't parse a
+*decimal* API level some system images report (e.g. `37.0`), and silently
+writes broken, unresolved template placeholders into the new AVD's files
+instead of real values (`target=android-0` in the AVD's `.ini` pointer
+file; `avd.id=<build>`, `disk.dataPartition.path=<temp>` in its
+`config.ini`) — a partial AVD identity that's consistent with the observed
+boot-loop. Confirmed by direct inspection, and confirmed that Android
+Studio's own newer AVD tooling correctly parses the decimal value and
+silently repairs these exact fields on "Edit AVD → Finish" with no other
+change, after which the same AVD boots fine. This lab now detects and
+repairs those same broken markers itself, right after AVD creation — no
+manual Studio step needed. If you ever see this on a *new* system image in
+the future (a different, not-yet-seen broken marker), the fix is the same
+manual workaround: open Android Studio's AVD Manager, edit the AVD, and
+click Finish with no changes.
 
 **Emulator never boots / `init` looks stuck with no output**
 
@@ -427,6 +427,13 @@ wait-for-device` (which used to hang forever with zero output when the
 emulator never registered with adb at all). If you hit this, it's almost
 always missing hardware acceleration — enable **Windows Hypervisor
 Platform** ("Turn Windows features on or off") and VT-x/AMD-V in BIOS/UEFI.
+
+**`init` is waiting at the Magisk root step**
+
+Expected on a fresh AVD — see [Root: Play Store + Magisk by
+default](#root-play-store--magisk-by-default). Open the Magisk app inside
+the emulator window and set Superuser access to auto-grant for ADB/shell
+requests; `init` notices within a few seconds and continues on its own.
 
 **"Can't find service" / "Too early to start activity" during transfer or install**
 
@@ -451,8 +458,7 @@ failed: !rcEnc->featureInfo()->hasReadColorBufferDma` on at least one
 source-image variant's DMA readback path regardless of GPU mode or the
 actual display state, so an automated check here would always be an
 unreliable false positive/negative with zero real signal. You have to look
-at the source window yourself; if it's genuinely blank/black/white, confirm
-you're not on a `_ps16k` experimental image (see above) and try
+at the source window yourself; if it's genuinely blank/black/white, try
 `--source-gpu-mode=auto` or `swiftshader_indirect` (whichever you're not
 currently using). You can also check the real underlying state without
 `screencap`, e.g. `adb shell dumpsys window | grep mCurrentFocus` — if it
