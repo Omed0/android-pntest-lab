@@ -91,11 +91,18 @@ export const DEFAULTS = {
   abi:            "x86_64",
   /**
    * System-image variant tag.
-   * "google_apis"          — Play-Store-free, rootable with rootAVD / Magisk
-   * "google_apis_playstore"— includes Play Store (harder to root)
+   * "google_apis_playstore"— includes Play Store — the default, confirmed
+   *                          working end-to-end (real Magisk root + Play
+   *                          Store on one device, see README "Play Store
+   *                          and root on the same device"). Needs magiskRoot
+   *                          true (also the default) since Play Store images
+   *                          can't use plain `adb root`.
+   * "google_apis"          — Play-Store-free, rootable with plain `adb root`
+   *                          alone (no Magisk needed) — lighter/faster if an
+   *                          app doesn't need Play Services at all.
    * "aosp_atd"             — lean automated-test image, fastest boot
    */
-  systemImageTag: "google_apis",
+  systemImageTag: "google_apis_playstore",
   /** Device hardware profile passed to avdmanager -d. */
   deviceProfile:  "pixel_7_pro",
   /** Emulator RAM in MB. */
@@ -250,15 +257,23 @@ export const DEFAULTS = {
 
   // ── Root ──────────────────────────────────────────────────────────────────
   /**
-   * When true, after the target boots, download rootAVD
+   * When true (the default, since systemImageTag defaults to
+   * "google_apis_playstore"), after the target boots, download rootAVD
    * (https://github.com/newbit1/rootAVD) and patch the target's ramdisk
-   * with real Magisk (not just `adb root`) — some apps detect root via the
-   * `su`/Magisk app specifically, not the adbd root mode this lab already
-   * uses by default. Off by default because it modifies the AVD image and
-   * takes an extra boot cycle; pass --magisk-root to enable it. See
-   * src/magisk.ts (ensureMagiskRoot) for the implementation.
+   * with real Magisk — required for root at all on a Play Store image
+   * (plain `adb root` is blocked by Google on those), and also defeats
+   * `su`/Magisk-app-specific root checks that plain adb-root can't fool.
+   * Confirmed working end-to-end (see README "Play Store and root on the
+   * same device"). One-time manual step on a fresh AVD: if `su -c id`
+   * comes back "Permission denied" after the patch, open the Magisk app
+   * inside the emulator and set Superuser access to auto-grant (not
+   * prompt) for ADB/shell requests — Magisk's own access policy, not a
+   * broken patch; rerun after that and it picks it up immediately, no
+   * repatch needed. Disable with --no-magisk-root (e.g. if you switch
+   * --system-image-tag=google_apis, which only needs plain adb-root and
+   * doesn't need this at all). See src/magisk.ts (ensureMagiskRoot).
    */
-  magiskRoot:     false,
+  magiskRoot:     true,
 } as const;
 
 // ── LabConfig interface ───────────────────────────────────────────────────────
@@ -492,9 +507,12 @@ SDK options
                            additive to the CLI-managed SDK this lab uses.
 
 Root options
-  --magisk-root            Patch the target's ramdisk with real Magisk via
-                           rootAVD after first boot (su/Magisk-specific
-                           detection, not just adb-root). Off by default.
+  --no-magisk-root         Skip patching the target's ramdisk with real
+                           Magisk via rootAVD. On by default (needed for
+                           root at all on the default google_apis_playstore
+                           image); harmless to disable if you switch
+                           --system-image-tag=google_apis, which only
+                           needs plain adb-root.
 
 Frida options
   --frida-version=<ver>    Pin frida version ["auto" = match host]  LAB_FRIDA_VERSION
