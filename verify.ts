@@ -109,13 +109,22 @@ async function main(): Promise<void> {
 
   const idShell = adb.shell("id");
   const isRootShell = /uid=0/.test(idShell);
-  printRow("adb shell id", idShell || "(empty)", isRootShell);
+  // Shown for diagnostic detail, but NOT reflected as a red X on its own —
+  // a Play Store + Magisk target (this project's default) never gets plain
+  // adb-root at all (Google blocks it), so "adb shell id" reporting shell
+  // here is the EXPECTED, correct state, not a problem. Marking this row
+  // red on every default setup was confusing (a legitimately healthy lab
+  // still showed a failure-looking ✗ with nothing actually wrong) — the
+  // combined "Root" line below is the one that actually reflects health.
+  printRow("adb shell id", idShell || "(empty)", true);
+  if (!isRootShell && verbose) log.info("  (expected: plain adb-root doesn't work on a Play Store image; su below is what matters)");
 
   const idSu = adb.shell("su -c id");
   const isSuRoot = /uid=0/.test(idSu);
   printRow("su -c id", idSu || "(empty)", isSuRoot);
 
   const rootOk = isRootShell || isSuRoot;
+  printRow("Root", rootOk ? `OK (via ${isRootShell ? "adb-root" : "su/Magisk"})` : "NOT ROOTED", rootOk);
   if (!rootOk) {
     allOk = false;
     log.warn("No root — frida-server requires root. Root the AVD first.");
@@ -124,17 +133,31 @@ async function main(): Promise<void> {
   // ── 5. frida-server on device ──────────────────────────────────────────────
   console.log("\n\x1b[1m── frida-server (device) ────────────────\x1b[0m");
 
-  // List all frida-server processes
-  const fsProcs = adb.rootShell("ps -A 2>/dev/null | grep frida-server || true");
-  if (fsProcs.trim()) {
-    const lines = fsProcs.trim().split(/\r?\n/);
-    for (const line of lines) {
-      printRow("frida-server proc", line.trim(), true);
-    }
+  // `pidof <name>` (the same technique deployFridaServer() in src/frida.ts
+  // already relies on to confirm a fresh deploy) rather than `ps -A | grep`:
+  // confirmed directly that the two can disagree on this device/Magisk
+  // combo — ps -A's output apparently doesn't reliably surface the process
+  // to a piped grep here (su -c wraps the whole pipeline through Magisk's
+  // own request-logging content-provider call, which showed up as its own
+  // process in `ps -ef` instead of the actual frida-server line coming
+  // through) even while frida-ps could still reach a genuinely running
+  // server — i.e. `ps -A | grep` produced a false "not running" here.
+  let frServerRunning = false;
+  let frServerDetail = "none running";
+  if (fridaVersion) {
+    const pid = adb.rootShell(`pidof frida-server-${fridaVersion} 2>/dev/null || true`).trim();
+    frServerRunning = /^\d+$/.test(pid);
+    frServerDetail = frServerRunning ? `frida-server-${fridaVersion} (PID=${pid})` : "none running";
   } else {
-    printRow("frida-server proc", "none running", false);
-    allOk = false;
+    // Host Frida version unknown (already flagged above) — fall back to a
+    // generic name search since there's no specific versioned binary name
+    // to pidof for.
+    const fsProcs = adb.rootShell("ps -A 2>/dev/null | grep frida-server || true").trim();
+    frServerRunning = !!fsProcs;
+    frServerDetail = fsProcs || "none running";
   }
+  printRow("frida-server proc", frServerDetail, frServerRunning);
+  if (!frServerRunning) allOk = false;
 
   // Check versioned binary exists on device
   if (fridaVersion) {
