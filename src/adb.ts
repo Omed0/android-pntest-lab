@@ -20,6 +20,10 @@ export class Adb {
     return run(this.exePath, this.serial ? ["-s", this.serial, ...args] : args);
   }
 
+  private execTimed(timeoutMs: number, ...args: string[]) {
+    return run(this.exePath, this.serial ? ["-s", this.serial, ...args] : args, { timeoutMs });
+  }
+
   // ── Server ────────────────────────────────────────────────────────────────
 
   startServer(): void {
@@ -54,9 +58,20 @@ export class Adb {
 
   // ── Shell commands ────────────────────────────────────────────────────────
 
-  /** Run a shell command, return trimmed stdout. */
-  shell(cmd: string): string {
-    return this.exec("shell", cmd).stdout.trim();
+  /**
+   * Run a shell command, return trimmed stdout.
+   * @param timeoutMs  Optional bound on how long to wait. Without one, a
+   *   device that's mid-reboot (or otherwise wedged) can make `adb shell`
+   *   hang indefinitely — confirmed directly this froze a manual-step
+   *   polling loop with zero output, no crash, no reminder, indistinguishable
+   *   from the process being stuck. Only pass this where a hang would
+   *   otherwise be silent and repeated (e.g. a poll loop); most call sites
+   *   run a quick one-off command where a genuine hang means something is
+   *   actually broken and should surface as one.
+   */
+  shell(cmd: string, timeoutMs?: number): string {
+    const r = timeoutMs ? this.execTimed(timeoutMs, "shell", cmd) : this.exec("shell", cmd);
+    return r.stdout.trim();
   }
 
   /**

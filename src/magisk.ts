@@ -264,7 +264,16 @@ export async function ensureMagiskRoot(cfg: LabConfig, platform: PlatformInfo, a
     // check, wait and poll: the moment the user opens the Magisk app inside
     // the emulator and sets Superuser access to auto-grant, this notices
     // within one poll interval and continues on its own, no rerun needed.
-    let suCheck = adb.shell("su -c id");
+    // Bounded, not a bare adb.shell(): if the user reboots the emulator
+    // themselves (e.g. reacting to a Magisk/system popup) while this loop is
+    // polling, `adb shell` on a mid-reboot device can hang instead of
+    // failing fast — confirmed directly this silently froze the whole wait
+    // loop (no crash, no further reminders, indistinguishable from being
+    // stuck) because the unbounded call never returned for checkOnce() to
+    // see. A bounded check just comes back "not granted yet" and the loop
+    // keeps polling/reminding normally once the device is reachable again.
+    const SU_CHECK_TIMEOUT_MS = 15_000;
+    let suCheck = adb.shell("su -c id", SU_CHECK_TIMEOUT_MS);
     if (!/uid=0/.test(suCheck)) {
       const granted = await waitForManualStep({
         instructions: [
@@ -273,7 +282,7 @@ export async function ensureMagiskRoot(cfg: LabConfig, platform: PlatformInfo, a
           "This will notice automatically once granted and continue — no need to rerun anything.",
         ],
         checkFn: () => {
-          suCheck = adb.shell("su -c id");
+          suCheck = adb.shell("su -c id", SU_CHECK_TIMEOUT_MS);
           return /uid=0/.test(suCheck);
         },
       });

@@ -10,6 +10,17 @@ export interface RunResult {
 export interface RunOpts {
   cwd?: string;
   env?: Record<string, string>;
+  /**
+   * Kill the process (SIGTERM) and return if it hasn't exited within this
+   * many ms, instead of blocking forever. Opt-in only — most callers here
+   * run quick one-off commands where a hang would mean something is
+   * actually broken, but a few (adb pull of a large APK, sdkmanager
+   * installs) are expected to legitimately take a long time, so there's no
+   * safe global default. Confirmed directly that Bun.spawnSync's own
+   * `timeout` does kill a genuinely hung child and return control rather
+   * than blocking indefinitely.
+   */
+  timeoutMs?: number;
 }
 
 // ── Synchronous ───────────────────────────────────────────────────────────────
@@ -23,6 +34,7 @@ export function run(cmd: string, args: string[] = [], opts: RunOpts = {}): RunRe
       stderr: "pipe",
       cwd: opts.cwd,
       env: opts.env ? { ...process.env as Record<string,string>, ...opts.env } : process.env as Record<string,string>,
+      timeout: opts.timeoutMs,
     });
     return {
       stdout: proc.stdout?.toString() ?? "",
