@@ -115,6 +115,7 @@ Install or provide yourself:
 
 - Bun 1.4+
 - A proxy tool if you want traffic capture (Burp Suite is the default; any other HTTP(S) proxy works too — see below)
+- `openssl` on PATH, needed to install/verify the proxy CA certificate — not bundled or auto-installed by this project. Windows doesn't ship it by default; Git for Windows bundles one (usually at `<git-install>\usr\bin\openssl.exe`), or install OpenSSL directly. Everything except proxy/HTTPS interception works fine without it — a missing `openssl` degrades that one feature with a clear warning instead of failing `init`.
 - Network access for SDK/Frida/system-image downloads
 
 Everything else is automated by `bun run init -- --install-sdk`:
@@ -480,6 +481,26 @@ launch call to 120s so a genuine hang fails with an actionable message
 (check antivirus logs, or exclude the SDK's `emulator/` directory)
 instead of blocking forever. This is a one-time cost per machine — once
 Windows/AV has seen these executables, later launches start immediately.
+
+**"Burp CA is not a readable X.509 certificate" (or `init` used to exit with this error)**
+
+This no longer aborts `init` — root, Frida, and both emulators finish and
+stay usable; only proxy/HTTPS interception is skipped, with a clear
+warning telling you to rerun once fixed. Two distinct real causes produce
+similar-looking messages, now disambiguated in the log:
+
+- **`openssl` isn't on PATH** — printed as its own explicit warning
+  ("openssl not found on PATH…") the first time it's needed. Windows
+  doesn't ship `openssl` by default; install it via Git for Windows
+  (bundles one) or a standalone OpenSSL build, then rerun `bun run init`
+  or `bun run.ts`. This was byte-for-byte indistinguishable from the next
+  cause before this fix, since a missing command and a real parse failure
+  both surfaced as the same generic message.
+- **Something answered on the configured host:port, but it wasn't Burp's
+  CA** — a wrong `--proxy-port`, Burp not actually running yet, or a
+  different service on that port. Now reported as "Burp responded on
+  `<host>:<port>` but the content doesn't look like a certificate" at
+  download time, before ever reaching the certificate-parsing step.
 
 **Emulator window is black/white/grey**
 

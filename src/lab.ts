@@ -276,9 +276,24 @@ export async function bootstrapLab(labRoot: string, argv: string[] = process.arg
   // idempotent steps anyway (e.g. after a device restart, or to switch to a
   // different proxy tool for one run), so doing it here too is never
   // wasted work. --no-proxy skips this entirely.
+  //
+  // Wrapped in try/catch, matching the boot-timeout retry and root
+  // verification blocks above in this same function: a proxy/cert problem
+  // (bad download, openssl missing, an unexpected adb failure) should never
+  // undo the root+Frida setup that already succeeded by this point.
+  // ensureProxyCertificate() itself already degrades gracefully internally
+  // (see src/proxy.ts) — this is a second, independent safety net in case
+  // something there still throws unexpectedly in the future.
   if (cfg.proxyEnabled) {
-    setDeviceProxy(adb, cfg.burpHost, cfg.burpPort, cfg.proxyTool);
-    await ensureProxyCertificate(adb, labRoot, platform, cfg.burpHost, cfg.burpPort, undefined, cfg.proxyTool);
+    try {
+      setDeviceProxy(adb, cfg.burpHost, cfg.burpPort, cfg.proxyTool);
+      await ensureProxyCertificate(adb, labRoot, platform, cfg.burpHost, cfg.burpPort, undefined, cfg.proxyTool);
+    } catch (error) {
+      log.warn(
+        `Proxy/certificate setup failed: ${error instanceof Error ? error.message : String(error)}\n` +
+        "  Root, Frida, and both emulators are still fully usable — rerun `bun run init` or `bun run.ts` to retry proxy setup.",
+      );
+    }
   } else {
     log.info("Proxy setup skipped (--no-proxy).");
   }

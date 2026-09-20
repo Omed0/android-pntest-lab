@@ -9,9 +9,70 @@
 import { copyFileSync, existsSync, mkdirSync, readdirSync, statSync } from "fs";
 import { join } from "path";
 import { log } from "./log.ts";
-import { run } from "./exec.ts";
+import { run, which } from "./exec.ts";
 import type { findAdb } from "./adb.ts";
 import type { detectPlatform } from "./platform.ts";
+
+// ── openssl availability ──────────────────────────────────────────────────────
+//
+// Every certificate check below shells out to openssl. Nothing in this
+// project checks for it, documents it, or installs it — it's silently
+// assumed to already be on PATH. Windows doesn't ship it by default (only
+// via Git for Windows or a standalone install), so a genuinely fresh
+// machine can be missing it entirely. Before this check existed, a missing
+// openssl and a real "this file isn't actually a certificate" error
+// produced byte-for-byte the same downstream message ("Burp CA is not a
+// readable X.509 certificate") — run()'s ENOENT handling turns "command not
+// found" into an ordinary {ok:false, stdout:""} result, indistinguishable
+// from openssl running and finding nothing. Checked once and cached so a
+// missing tool doesn't reprint the same warning on every call in one run
+// (getProxyCertificatePem() alone can be called once per `bun run.ts`
+// invocation's unpinning-chain build).
+let opensslPathCache: string | null | undefined;
+function opensslAvailable(): boolean {
+  if (opensslPathCache === undefined) {
+    opensslPathCache = which("openssl");
+    if (!opensslPathCache) {
+      log.warn(
+        "openssl not found on PATH — needed to install/verify the proxy CA certificate.\n" +
+        "  Install it (Git for Windows bundles one, usually at <git>\\usr\\bin\\openssl.exe, or install OpenSSL\n" +
+        "  directly) and rerun `bun run init` / `bun run.ts`. Root, Frida, and both emulators are unaffected —\n" +
+        "  only HTTPS interception via the proxy CA needs this.",
+      );
+    }
+  }
+  return opensslPathCache !== null;
+}
+
+interface ParsedCertificate {
+  format: "DER" | "PEM";
+  pem: string;
+  hash: string;
+}
+
+/**
+ * Single source of truth for "is this file a readable X.509 certificate,
+ * and what is it" — replaces two previously-separate, inconsistent
+ * implementations (one PEM-first returning null on failure, one DER-first
+ * throwing on failure) that answered the same question differently.
+ * Tries DER first (Burp's own native export format) then PEM. Never
+ * throws — returns null on any failure, including openssl being absent.
+ */
+function readCertificate(certPath: string): ParsedCertificate | null {
+  if (!opensslAvailable()) return null;
+  for (const format of ["DER", "PEM"] as const) {
+    const pemResult = run("openssl", ["x509", "-in", certPath, "-inform", format, "-outform", "PEM"]);
+    if (!pemResult.ok || !pemResult.stdout.includes("BEGIN CERTIFICATE")) continue;
+    const hashResult = run("openssl", ["x509", "-subject_hash_old", "-inform", format, "-in", certPath]);
+    const hash = hashResult.stdout
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => /^[0-9a-f]{8}$/i.test(line));
+    if (!hash) continue;
+    return { format, pem: pemResult.stdout.trim(), hash: hash.toLowerCase() };
+  }
+  return null;
+}
 
 /**
  * Configure the emulator's global HTTP/HTTPS proxy to point at the
@@ -58,11 +119,7 @@ export function setDeviceProxy(
 export function getProxyCertificatePem(labRoot: string, requestedPath?: string): string | null {
   const certPath = findProxyCertificate(labRoot, requestedPath);
   if (!certPath) return null;
-  for (const format of ["PEM", "DER"]) {
-    const result = run("openssl", ["x509", "-in", certPath, "-inform", format, "-outform", "PEM"]);
-    if (result.ok && result.stdout.includes("BEGIN CERTIFICATE")) return result.stdout.trim();
-  }
-  return null;
+  return readCertificate(certPath)?.pem ?? null;
 }
 
 /**
@@ -133,33 +190,57 @@ function downloadBurpCertificate(labRoot: string, host: string, port: number): s
     "--output", certPath,
   ]);
   if (result.ok && existsSync(certPath) && statSync(certPath).size > 0) {
-    log.good(`Burp CA downloaded to ${certPath}`);
-    return certPath;
+    // curl succeeding and writing a non-empty file only proves *something*
+    // answered with a 2xx body — not that it was actually Burp's CA. A
+    // captive portal page, a different service answering on that host:port,
+    // or any other non-empty 200 response would satisfy this and previously
+    // got logged as a successful download, only to fail opaquely one step
+    // later. Validate the actual content before declaring success.
+    if (readCertificate(certPath)) {
+      log.good(`Burp CA downloaded to ${certPath}`);
+      return certPath;
+    }
+    if (opensslAvailable()) {
+      log.warn(
+        `Burp responded on ${fetchHost}:${port} but the content doesn't look like a certificate — ` +
+        `is Burp actually running and is that really its proxy listener?`,
+      );
+    }
+    return null;
   }
 
   log.warn(`Could not download Burp CA automatically: ${result.stderr.trim() || "Burp listener did not respond"}`);
   return null;
 }
 
-function prepareAndroidCertificate(labRoot: string, certPath: string): { hash: string; derPath: string } {
-  const derPath = join(labRoot, "cert", ".burp-ca.der");
-  for (const format of ["DER", "PEM"]) {
-    const hashResult = run("openssl", ["x509", "-subject_hash_old", "-inform", format, "-in", certPath]);
-    const hash = hashResult.stdout
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .find((line) => /^[0-9a-f]{8}$/i.test(line));
-    if (!hash) continue;
-
-    if (format === "DER") {
-      if (certPath !== derPath) copyFileSync(certPath, derPath);
-    } else {
-      const convert = run("openssl", ["x509", "-in", certPath, "-outform", "DER", "-out", derPath]);
-      if (!convert.ok) throw new Error(`Could not convert Burp CA to DER: ${convert.stderr.trim()}`);
+/**
+ * Never throws — a proxy/cert problem should degrade to "proxy interception
+ * unavailable this run" (see README: "warns and continues rather than
+ * aborting the whole setup"), not take down an otherwise-fully-successful
+ * `bun run init`/`bun run.ts`. Returns null on any failure; the specific
+ * reason (openssl missing vs. genuinely not a certificate) was already
+ * logged by readCertificate()/opensslAvailable().
+ */
+function prepareAndroidCertificate(labRoot: string, certPath: string): { hash: string; derPath: string } | null {
+  const info = readCertificate(certPath);
+  if (!info) {
+    if (opensslAvailable()) {
+      log.warn(`Burp CA is not a readable X.509 certificate: ${certPath}`);
     }
-    return { hash: hash.toLowerCase(), derPath };
+    return null;
   }
-  throw new Error(`Burp CA is not a readable X.509 certificate: ${certPath}`);
+
+  const derPath = join(labRoot, "cert", ".burp-ca.der");
+  if (info.format === "DER") {
+    if (certPath !== derPath) copyFileSync(certPath, derPath);
+  } else {
+    const convert = run("openssl", ["x509", "-in", certPath, "-outform", "DER", "-out", derPath]);
+    if (!convert.ok) {
+      log.warn(`Could not convert Burp CA to DER: ${convert.stderr.trim()}`);
+      return null;
+    }
+  }
+  return { hash: info.hash, derPath };
 }
 
 /**
@@ -213,30 +294,53 @@ export async function ensureProxyCertificate(
     }
   }
 
-  const { hash, derPath } = prepareAndroidCertificate(labRoot, certPath);
-  log.info(`Using proxy CA: ${certPath}`);
-  log.info(`Installing into system trust store as ${hash}.0 (tmpfs overlay, no writable-system/reboot)…`);
-  const ok = adb.installSystemCert(derPath, hash, (local, remote) => adb.push(local, remote, platform));
-
-  // Also push the same DER cert to a fixed, well-known path — this is the
-  // exact file the classic "frida-android-repinning.js"-style scripts
-  // expect at /data/local/tmp/cert-der.crt (their own usage comment says to
-  // `adb push burpca-cert-der.crt /data/local/tmp/cert-der.crt` by hand
-  // before running them). Doing it here means any such script just works
-  // without that manual step, using the exact same CA already installed
-  // into the system trust store above.
-  const REPIN_CERT_PATH = "/data/local/tmp/cert-der.crt";
-  adb.push(derPath, REPIN_CERT_PATH, platform);
-  adb.shell(`chmod 644 ${REPIN_CERT_PATH}`);
-  log.good(`CA also pushed to ${REPIN_CERT_PATH} (for repinning-style Frida scripts).`);
-
-  if (!ok) {
+  const prepared = prepareAndroidCertificate(labRoot, certPath);
+  if (!prepared) {
     log.warn(
-      "Proxy CA was not installed into the system trust store.\n" +
-        "The device must be rooted (it is, per the root check). As a fallback you can\n" +
-        "intercept HTTPS via the Frida SSL-unpinning script: --frida-script=scripts/ssl-unpinning.js",
+      "Proxy CA setup skipped — root, Frida, and both emulators are unaffected; " +
+      "fix the certificate (see the warning above) and rerun `bun run init` or `bun run.ts` to enable HTTPS interception.",
     );
     return;
   }
-  log.good(`Proxy system CA installed: /system/etc/security/cacerts/${hash}.0`);
+  const { hash, derPath } = prepared;
+  log.info(`Using proxy CA: ${certPath}`);
+
+  // Defense in depth: adb.push() throws on failure (a flaky post-boot binder
+  // error, a device disconnect mid-push, etc.), and everything below this
+  // point is on-device work that can fail in ways this function can't fully
+  // predict. A cert-install hiccup here should degrade the same way a
+  // missing/bad certificate above already does — not take down an
+  // otherwise-fully-successful `bun run init` (root + Frida already done).
+  try {
+    log.info(`Installing into system trust store as ${hash}.0 (tmpfs overlay, no writable-system/reboot)…`);
+    const ok = adb.installSystemCert(derPath, hash, (local, remote) => adb.push(local, remote, platform));
+
+    // Also push the same DER cert to a fixed, well-known path — this is the
+    // exact file the classic "frida-android-repinning.js"-style scripts
+    // expect at /data/local/tmp/cert-der.crt (their own usage comment says to
+    // `adb push burpca-cert-der.crt /data/local/tmp/cert-der.crt` by hand
+    // before running them). Doing it here means any such script just works
+    // without that manual step, using the exact same CA already installed
+    // into the system trust store above.
+    const REPIN_CERT_PATH = "/data/local/tmp/cert-der.crt";
+    adb.push(derPath, REPIN_CERT_PATH, platform);
+    adb.shell(`chmod 644 ${REPIN_CERT_PATH}`);
+    log.good(`CA also pushed to ${REPIN_CERT_PATH} (for repinning-style Frida scripts).`);
+
+    if (!ok) {
+      log.warn(
+        "Proxy CA was not installed into the system trust store.\n" +
+          "The device must be rooted (it is, per the root check). As a fallback, the default\n" +
+          "`bun run.ts` unpinning suite (scripts/unpinning/) can still use the CA pushed to\n" +
+          "/data/local/tmp/cert-der.crt above without a system trust store entry.",
+      );
+      return;
+    }
+    log.good(`Proxy system CA installed: /system/etc/security/cacerts/${hash}.0`);
+  } catch (error) {
+    log.warn(
+      `Proxy CA install failed: ${error instanceof Error ? error.message : String(error)}\n` +
+      "  Root, Frida, and both emulators are unaffected — rerun `bun run init` or `bun run.ts` to retry.",
+    );
+  }
 }
