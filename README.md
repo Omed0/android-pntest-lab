@@ -467,6 +467,20 @@ android-pentest-lab/
 
 ## Troubleshooting
 
+**`init` prints "Launching emulator: ..." and then nothing for a long time (first run on a brand-new machine)**
+
+Usually not a hang: Windows antivirus/EDR real-time protection can
+synchronously scan a large executable it's never seen before
+(`emulator.exe`, `qemu-system-x86_64.exe`) before letting it actually
+start, which can take anywhere from several seconds to a couple of
+minutes with zero output in the meantime — confirmed as the emulator
+launch is a synchronous call that genuinely blocks until Windows lets the
+process start. `init` now prints a heads-up about this and bounds the
+launch call to 120s so a genuine hang fails with an actionable message
+(check antivirus logs, or exclude the SDK's `emulator/` directory)
+instead of blocking forever. This is a one-time cost per machine — once
+Windows/AV has seen these executables, later launches start immediately.
+
 **Emulator window is black/white/grey**
 
 The cause was `hw.gpu.enabled=no` in the AVD's `config.ini` — fixed for every

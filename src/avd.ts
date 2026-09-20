@@ -502,8 +502,27 @@ export function launchWindowsEmulator(
   const ps = `(Start-Process -FilePath '${emuPath}' -ArgumentList ${argStr} ` +
     `-RedirectStandardOutput '${stdoutLog}' -RedirectStandardError '${stderrLog}' ` +
     `${windowFlag} -PassThru).Id`;
-  const r = run("powershell", ["-NoProfile", "-Command", ps]);
+  // `Start-Process -PassThru` normally returns almost instantly — it only
+  // launches the child and hands back its PID, it doesn't wait for it to do
+  // anything. But on a machine that has never run this SDK's emulator.exe/
+  // qemu-system-x86_64.exe before, antivirus real-time protection can
+  // synchronously scan a large unrecognized executable before letting
+  // CreateProcess return, which blocks THIS call (it's a plain synchronous
+  // spawnSync) for anywhere from several seconds to a couple of minutes —
+  // with zero output in the meantime, indistinguishable from the script
+  // being frozen. Bound it so a genuine hang (not just a slow first-run
+  // scan) fails with an actionable message instead of blocking forever.
+  log.info("Starting the emulator process (a brand-new machine's first launch can take noticeably longer here — antivirus scanning a never-seen executable is the usual reason, not a hang)…");
+  const r = run("powershell", ["-NoProfile", "-Command", ps], { timeoutMs: 120_000 });
   const pid = parseInt(r.stdout.trim(), 10);
+  if (isNaN(pid)) {
+    log.warn(
+      `Could not read a PID back from the emulator launch (PowerShell output: "${r.stdout.trim()}", ` +
+      `stderr: "${r.stderr.trim()}"). If this was a timeout, antivirus/EDR software may be blocking or ` +
+      `heavily delaying emulator.exe/qemu-system-x86_64.exe — check its logs or add an exclusion for ` +
+      `the SDK's emulator/ directory, then retry.`,
+    );
+  }
   return isNaN(pid) ? 0 : pid;
 }
 
