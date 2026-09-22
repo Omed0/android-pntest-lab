@@ -26,7 +26,12 @@ import { detectPlatform } from "./src/platform.ts";
 import { DEFAULTS, loadConfig, printConfig } from "./src/config.ts";
 import { findAdb } from "./src/adb.ts";
 import { bringEmulatorWindowToFront } from "./src/avd.ts";
-import { setDeviceProxy, ensureProxyCertificate, clearDeviceProxy, getDeviceProxy } from "./src/proxy.ts";
+import {
+  setDeviceProxy,
+  ensureProxyCertificate,
+  clearDeviceProxy,
+  getDeviceProxy,
+} from "./src/proxy.ts";
 import { buildUnpinningScriptChain } from "./src/unpinning.ts";
 import {
   activatePortablePython,
@@ -36,6 +41,7 @@ import {
   verifyFridaConnection,
 } from "./src/frida.ts";
 import { run, runLive } from "./src/exec.ts";
+import { ensureOpenSSL } from "./src/sdk.ts";
 import { packageInstalled as sharedPackageInstalled } from "./src/apkpull.ts";
 
 // ── Run-specific CLI options ──────────────────────────────────────────────────
@@ -216,10 +222,11 @@ function packageInstalled(
   adb: ReturnType<typeof findAdb>,
   pkg: string,
 ): boolean {
-  return sharedPackageInstalled((...args) => run(adb.exePath, [
-    ...(adb.serial ? ["-s", adb.serial] : []),
-    ...args,
-  ]), pkg);
+  return sharedPackageInstalled(
+    (...args) =>
+      run(adb.exePath, [...(adb.serial ? ["-s", adb.serial] : []), ...args]),
+    pkg,
+  );
 }
 
 async function transferPackage(
@@ -393,12 +400,22 @@ async function attachFrida(
 
   const scriptChain: string[] = [];
   if (!noUnpinning) {
-    const chain = buildUnpinningScriptChain(labRoot, burpHost, burpPort, verbose, pkg);
+    const chain = buildUnpinningScriptChain(
+      labRoot,
+      burpHost,
+      burpPort,
+      verbose,
+      pkg,
+    );
     if (chain) {
       scriptChain.push(...chain);
-      log.good(`Loading HTTPToolkit unpinning suite (${chain.length} scripts).`);
+      log.good(
+        `Loading HTTPToolkit unpinning suite (${chain.length} scripts).`,
+      );
     } else {
-      log.warn("Unpinning suite unavailable this run — see warning above. Continuing without it.");
+      log.warn(
+        "Unpinning suite unavailable this run — see warning above. Continuing without it.",
+      );
     }
   }
   if (extraScript) {
@@ -535,6 +552,11 @@ async function main(): Promise<void> {
 
   // ── 4. Proxy (Burp by default) ─────────────────────────────────────────────
   if (runOpts.burp) {
+    // Resolve OpenSSL in known install locations as well as PATH. This makes
+    // a `bun run.ts` immediately after `bun run init -- --install-sdk` work
+    // even though the child process inherited the old PATH from the shell.
+    await ensureOpenSSL(cfg, platform);
+
     setDeviceProxy(adb, cfg.burpHost, cfg.burpPort, runOpts.proxyTool);
     await ensureProxyCertificate(
       adb,

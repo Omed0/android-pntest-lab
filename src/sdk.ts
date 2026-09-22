@@ -14,14 +14,22 @@ import { existsSync, mkdirSync, renameSync } from "fs";
 import { join, basename, dirname } from "path";
 import { log } from "./log.ts";
 import { run, runWithStdin, runLive } from "./exec.ts";
-import { downloadFile, extractZip, extractZipFlattenRoot, ensure7z } from "./download.ts";
+import {
+  downloadFile,
+  extractZip,
+  extractZipFlattenRoot,
+  ensure7z,
+} from "./download.ts";
 import type { LabConfig } from "./config.ts";
 import type { PlatformInfo } from "./platform.ts";
 
 // ── Java (required by sdkmanager.bat/avdmanager.bat, never checked before) ────
 
 function javaAlreadyWorks(): boolean {
-  return run("java", ["-version"]).exitCode === 0 || run("java", ["-version"]).stderr.includes("version");
+  return (
+    run("java", ["-version"]).exitCode === 0 ||
+    run("java", ["-version"]).stderr.includes("version")
+  );
 }
 
 /** Where --portable downloads a private JRE, independent of the host's own Java. */
@@ -50,7 +58,10 @@ function usePortableJava(javaExe: string): void {
  * tools/java/ and used only from there — the host's own Java (if any) is
  * never touched and winget is never invoked.
  */
-export async function ensureJava(cfg: LabConfig, platform: PlatformInfo): Promise<void> {
+export async function ensureJava(
+  cfg: LabConfig,
+  platform: PlatformInfo,
+): Promise<void> {
   if (cfg.portable) {
     const javaExe = portableJavaExe(cfg, platform);
     if (existsSync(javaExe)) {
@@ -60,15 +71,19 @@ export async function ensureJava(cfg: LabConfig, platform: PlatformInfo): Promis
     if (platform.type !== "windows") {
       throw new Error(
         "--portable Java install is only implemented for Windows right now.\n" +
-        "Install a JRE normally on this platform (e.g. sudo apt install default-jre) and rerun without --portable.",
+          "Install a JRE normally on this platform (e.g. sudo apt install default-jre) and rerun without --portable.",
       );
     }
-    log.info("Portable mode: downloading a private JRE into tools/java/ (the host's own Java, if any, is left untouched)…");
-    const url = "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jre/hotspot/normal/eclipse";
+    log.info(
+      "Portable mode: downloading a private JRE into tools/java/ (the host's own Java, if any, is left untouched)…",
+    );
+    const url =
+      "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jre/hotspot/normal/eclipse";
     const zipFile = join(cfg.cacheDir, "temurin-21-jre-windows-x64.zip");
     await downloadFile(url, zipFile);
     extractZipFlattenRoot(zipFile, join(cfg.toolsDir, "java"), platform, cfg);
-    if (!existsSync(javaExe)) throw new Error(`Portable Java download did not produce ${javaExe}`);
+    if (!existsSync(javaExe))
+      throw new Error(`Portable Java download did not produce ${javaExe}`);
     usePortableJava(javaExe);
     log.good(`Portable Java ready: ${javaExe}`);
     return;
@@ -80,19 +95,24 @@ export async function ensureJava(cfg: LabConfig, platform: PlatformInfo): Promis
   if (!cfg.installSdk) {
     throw new Error(
       "Java (JRE/JDK) not found and is required to run the Android cmdline-tools.\n\n" +
-      "Install one and rerun, or rerun with --install-sdk to auto-install via winget\n" +
-      "(or --portable to download a private copy into this project instead):\n" +
-      "  Windows: winget install EclipseAdoptium.Temurin.21.JRE\n" +
-      "  Linux:   sudo apt install default-jre\n" +
-      "  macOS:   brew install openjdk",
+        "Install one and rerun, or rerun with --install-sdk to auto-install via winget\n" +
+        "(or --portable to download a private copy into this project instead):\n" +
+        "  Windows: winget install EclipseAdoptium.Temurin.21.JRE\n" +
+        "  Linux:   sudo apt install default-jre\n" +
+        "  macOS:   brew install openjdk",
     );
   }
 
   if (process.platform === "win32" && run("winget", ["--version"]).ok) {
     log.info("Installing a JRE via winget…");
     const code = await runLive("winget", [
-      "install", "--id", "EclipseAdoptium.Temurin.21.JRE", "--exact",
-      "--silent", "--accept-source-agreements", "--accept-package-agreements",
+      "install",
+      "--id",
+      "EclipseAdoptium.Temurin.21.JRE",
+      "--exact",
+      "--silent",
+      "--accept-source-agreements",
+      "--accept-package-agreements",
     ]);
     if (code === 0 && javaAlreadyWorks()) {
       log.good("Java installed.");
@@ -102,11 +122,155 @@ export async function ensureJava(cfg: LabConfig, platform: PlatformInfo): Promis
 
   throw new Error(
     "Could not find or install Java automatically.\n" +
-    "Install a JRE/JDK manually and rerun:\n" +
-    "  Windows: winget install EclipseAdoptium.Temurin.21.JRE\n" +
-    "  Linux:   sudo apt install default-jre\n" +
-    "  macOS:   brew install openjdk",
+      "Install a JRE/JDK manually and rerun:\n" +
+      "  Windows: winget install EclipseAdoptium.Temurin.21.JRE\n" +
+      "  Linux:   sudo apt install default-jre\n" +
+      "  macOS:   brew install openjdk",
   );
+}
+
+// ── OpenSSL (required for proxy CA generation/verification) ───────────────────
+
+const OPENSSL_WINGET_ID = "ShiningLight.OpenSSL.Light";
+
+function opensslAlreadyWorks(): boolean {
+  const r = run("openssl", ["version"]);
+  return r.exitCode === 0;
+}
+
+/**
+ * Add the directory containing OpenSSL to this process' PATH.
+ *
+ * A winget installation can update the persistent Windows PATH, but the
+ * already-running Bun process does not receive that changed environment.
+ * Updating process.env.PATH here makes OpenSSL immediately available to
+ * proxy.ts and any child processes started during this run.
+ */
+function useOpenSSL(opensslExe: string): void {
+  if (!existsSync(opensslExe)) return;
+
+  const binDir = dirname(opensslExe);
+  const sep = process.platform === "win32" ? ";" : ":";
+  const currentPath = process.env.PATH ?? "";
+  const alreadyInPath = currentPath
+    .split(sep)
+    .some((entry) => entry && entry.toLowerCase() === binDir.toLowerCase());
+
+  if (!alreadyInPath) {
+    process.env.PATH = `${binDir}${sep}${currentPath}`;
+  }
+}
+
+function findOpenSSL(platform: PlatformInfo): string | null {
+  if (opensslAlreadyWorks()) return "openssl";
+
+  // Windows installs commonly seen from OpenSSL Light and Git for Windows.
+  // Explicitly checking them matters immediately after a fresh install,
+  // because this Bun process inherited the old PATH from the parent shell.
+  if (platform.type === "windows") {
+    const programFiles =
+      process.env.ProgramW6432 ??
+      process.env.ProgramFiles ??
+      "C:\\Program Files";
+    const programFilesX86 =
+      process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)";
+
+    const candidates = [
+      join(programFiles, "OpenSSL-Win64", "bin", "openssl.exe"),
+      join(programFiles, "OpenSSL-Win32", "bin", "openssl.exe"),
+      join(programFiles, "OpenSSL", "bin", "openssl.exe"),
+      join(programFilesX86, "OpenSSL-Win32", "bin", "openssl.exe"),
+      join(programFiles, "Git", "usr", "bin", "openssl.exe"),
+      join(programFilesX86, "Git", "usr", "bin", "openssl.exe"),
+      process.env.LOCALAPPDATA
+        ? join(
+            process.env.LOCALAPPDATA,
+            "Programs",
+            "OpenSSL-Win64",
+            "bin",
+            "openssl.exe",
+          )
+        : "",
+    ].filter(Boolean);
+
+    for (const candidate of candidates) {
+      if (existsSync(candidate)) {
+        useOpenSSL(candidate);
+        if (opensslAlreadyWorks()) return candidate;
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Ensure OpenSSL is available for proxy CA generation.
+ *
+ * OpenSSL remains separate from the Android SDK itself, but --install-sdk is
+ * the project's existing "install missing prerequisites" switch, so Windows
+ * uses winget to install OpenSSL Light when needed.
+ *
+ * This is intentionally non-fatal: proxy certificate setup already degrades
+ * gracefully, and root/Frida/AVD initialization should not be undone by a
+ * missing HTTPS interception dependency.
+ */
+export async function ensureOpenSSL(
+  cfg: LabConfig,
+  platform: PlatformInfo,
+): Promise<boolean> {
+  // Keep --portable isolated: do not mutate the host or invoke winget for
+  // OpenSSL just because a portable SDK was requested.
+  if (cfg.portable) return findOpenSSL(platform) !== null;
+
+  if (findOpenSSL(platform)) {
+    return true;
+  }
+
+  // Preserve the existing non-fatal behavior when the caller did not opt into
+  // automatic prerequisite installation.
+  if (!cfg.installSdk) {
+    return false;
+  }
+
+  if (platform.type !== "windows") {
+    log.warn(
+      "OpenSSL not found — automatic OpenSSL installation via --install-sdk is currently implemented for Windows/winget.\n" +
+        "Install OpenSSL with your platform package manager and rerun.",
+    );
+    return false;
+  }
+
+  if (!run("winget", ["--version"]).ok) {
+    log.warn(
+      "winget not found — cannot auto-install OpenSSL. " +
+        "Install OpenSSL manually or install App Installer/winget, then rerun `bun run init -- --install-sdk`.",
+    );
+    return false;
+  }
+
+  log.info("Installing OpenSSL Light via winget…");
+  const code = await runLive("winget", [
+    "install",
+    "--id",
+    OPENSSL_WINGET_ID,
+    "--exact",
+    "--silent",
+    "--accept-source-agreements",
+    "--accept-package-agreements",
+  ]);
+
+  const resolved = findOpenSSL(platform);
+  if (code === 0 && resolved) {
+    log.good(`OpenSSL ready: ${resolved}`);
+    return true;
+  }
+
+  log.warn(
+    "Could not confirm OpenSSL installed automatically; continuing without HTTPS CA setup. " +
+      "Install it manually if Burp/HTTPS interception is required.",
+  );
+  return false;
 }
 
 // ── Android Studio (real, standard install — the opposite of --portable) ──────
@@ -130,7 +294,10 @@ export async function ensureAndroidStudio(cfg: LabConfig): Promise<void> {
 
   const installedPath = join(
     process.env.ProgramFiles ?? "C:\\Program Files",
-    "Android", "Android Studio", "bin", "studio64.exe",
+    "Android",
+    "Android Studio",
+    "bin",
+    "studio64.exe",
   );
   if (existsSync(installedPath)) {
     log.good("Android Studio already installed.");
@@ -140,19 +307,32 @@ export async function ensureAndroidStudio(cfg: LabConfig): Promise<void> {
   if (!cfg.installSdk) return; // don't nag about a multi-GB IDE without the install opt-in
 
   if (!run("winget", ["--version"]).ok) {
-    log.warn("winget not found — skipping Android Studio install (--no-android-studio to silence this).");
+    log.warn(
+      "winget not found — skipping Android Studio install (--no-android-studio to silence this).",
+    );
     return;
   }
 
-  log.info("Installing Android Studio via winget (this is a normal, Start-Menu-visible install, not a portable copy)…");
+  log.info(
+    "Installing Android Studio via winget (this is a normal, Start-Menu-visible install, not a portable copy)…",
+  );
   const code = await runLive("winget", [
-    "install", "--id", "Google.AndroidStudio", "--exact",
-    "--silent", "--accept-source-agreements", "--accept-package-agreements",
+    "install",
+    "--id",
+    "Google.AndroidStudio",
+    "--exact",
+    "--silent",
+    "--accept-source-agreements",
+    "--accept-package-agreements",
   ]);
   if (code === 0 && existsSync(installedPath)) {
-    log.good("Android Studio installed — it will now show up in Windows search / Start Menu.");
+    log.good(
+      "Android Studio installed — it will now show up in Windows search / Start Menu.",
+    );
   } else {
-    log.warn("Could not confirm Android Studio installed via winget; continuing without it (the CLI-managed SDK/AVDs are unaffected). Install manually with: winget install Google.AndroidStudio");
+    log.warn(
+      "Could not confirm Android Studio installed via winget; continuing without it (the CLI-managed SDK/AVDs are unaffected). Install manually with: winget install Google.AndroidStudio",
+    );
   }
 }
 
@@ -161,26 +341,32 @@ export async function ensureAndroidStudio(cfg: LabConfig): Promise<void> {
 const CMDTOOLS_BASE = "https://dl.google.com/android/repository";
 
 function cmdToolsUrl(version: string, platform: PlatformInfo): string {
-  const os = platform.type === "windows" ? "win"
-           : platform.type === "macos"   ? "mac"
-           :                               "linux";
+  const os =
+    platform.type === "windows"
+      ? "win"
+      : platform.type === "macos"
+        ? "mac"
+        : "linux";
   return `${CMDTOOLS_BASE}/commandlinetools-${os}-${version}_latest.zip`;
 }
 
 // ── sdkmanager / avdmanager paths ────────────────────────────────────────────
 
 function sdkmanagerPath(sdkRoot: string, platform: PlatformInfo): string {
-  const ext  = platform.type === "windows" || platform.type === "wsl" ? ".bat" : "";
+  const ext =
+    platform.type === "windows" || platform.type === "wsl" ? ".bat" : "";
   return join(sdkRoot, "cmdline-tools", "latest", "bin", `sdkmanager${ext}`);
 }
 
 function avdmanagerPath(sdkRoot: string, platform: PlatformInfo): string {
-  const ext = platform.type === "windows" || platform.type === "wsl" ? ".bat" : "";
+  const ext =
+    platform.type === "windows" || platform.type === "wsl" ? ".bat" : "";
   return join(sdkRoot, "cmdline-tools", "latest", "bin", `avdmanager${ext}`);
 }
 
 function sdkToolsPresent(root: string, platform: PlatformInfo): boolean {
-  const ext = platform.type === "windows" || platform.type === "wsl" ? ".bat" : "";
+  const ext =
+    platform.type === "windows" || platform.type === "wsl" ? ".bat" : "";
   return [
     join(root, "platform-tools", `adb${platform.exe}`),
     join(root, "emulator", `emulator${platform.exe}`),
@@ -210,16 +396,18 @@ export { sdkmanagerPath, avdmanagerPath };
  * portable run never silently borrows (or risks touching) it.
  */
 export function findSdk(cfg: LabConfig, platform: PlatformInfo): string | null {
-  const candidates = cfg.portable ? [cfg.sdkRoot] : [
-    cfg.sdkRoot,
-    process.env.ANDROID_HOME,
-    process.env.ANDROID_SDK_ROOT,
-    platform.sdkDefaultPath,
-    // WSL: Windows SDK mounted at /mnt/c/...
-    platform.windowsHome
-      ? join(platform.windowsHome, "AppData", "Local", "Android", "Sdk")
-      : null,
-  ].filter((p): p is string => !!p);
+  const candidates = cfg.portable
+    ? [cfg.sdkRoot]
+    : [
+        cfg.sdkRoot,
+        process.env.ANDROID_HOME,
+        process.env.ANDROID_SDK_ROOT,
+        platform.sdkDefaultPath,
+        // WSL: Windows SDK mounted at /mnt/c/...
+        platform.windowsHome
+          ? join(platform.windowsHome, "AppData", "Local", "Android", "Sdk")
+          : null,
+      ].filter((p): p is string => !!p);
 
   for (const root of candidates) {
     if (sdkRuntimePresent(root, platform)) {
@@ -242,16 +430,21 @@ export async function ensureSdk(
   log.step("Android SDK");
   await ensureJava(cfg, platform);
   await ensure7z(cfg, platform);
+  await ensureOpenSSL(cfg, platform);
   await ensureAndroidStudio(cfg);
 
   const existing = findSdk(cfg, platform);
   if (existing) {
     if (!sdkToolsPresent(existing, platform)) {
       if (cfg.installSdk) {
-        log.warn("SDK runtime found, but cmdline-tools are incomplete; repairing SDK tools.");
+        log.warn(
+          "SDK runtime found, but cmdline-tools are incomplete; repairing SDK tools.",
+        );
         return installHeadlessSdk(cfg, platform);
       }
-      log.warn("SDK runtime found; cmdline-tools are missing. Existing AVDs can run, but creating new AVDs requires --install-sdk.");
+      log.warn(
+        "SDK runtime found; cmdline-tools are missing. Existing AVDs can run, but creating new AVDs requires --install-sdk.",
+      );
     }
     log.good(`SDK found: ${existing}`);
     return existing;
@@ -260,12 +453,12 @@ export async function ensureSdk(
   if (!cfg.installSdk) {
     throw new Error(
       "Android SDK not found.\n\n" +
-      "Option A — use an existing installation:\n" +
-      "  bun run init -- --sdk-root=\"C:\\Users\\you\\AppData\\Local\\Android\\Sdk\"\n\n" +
-      "Option B — let this script install cmdline-tools automatically:\n" +
-      "  bun run init -- --install-sdk\n\n" +
-      "Option C — install Android Studio (full IDE):\n" +
-      "  https://developer.android.com/studio",
+        "Option A — use an existing installation:\n" +
+        '  bun run init -- --sdk-root="C:\\Users\\you\\AppData\\Local\\Android\\Sdk"\n\n' +
+        "Option B — let this script install cmdline-tools automatically:\n" +
+        "  bun run init -- --install-sdk\n\n" +
+        "Option C — install Android Studio (full IDE):\n" +
+        "  https://developer.android.com/studio",
     );
   }
 
@@ -280,14 +473,14 @@ async function installHeadlessSdk(
 ): Promise<string> {
   log.info("Installing Android cmdline-tools (headless)…");
 
-  const sdkRoot  = cfg.sdkRoot || join(cfg.toolsDir, "android-sdk");
+  const sdkRoot = cfg.sdkRoot || join(cfg.toolsDir, "android-sdk");
   const cacheDir = cfg.cacheDir;
-  mkdirSync(sdkRoot,  { recursive: true });
+  mkdirSync(sdkRoot, { recursive: true });
   mkdirSync(cacheDir, { recursive: true });
 
   // 1. Download cmdline-tools zip
-  const url      = cmdToolsUrl(cfg.cmdlineToolsVersion, platform);
-  const zipFile  = join(cacheDir, basename(url));
+  const url = cmdToolsUrl(cfg.cmdlineToolsVersion, platform);
+  const zipFile = join(cacheDir, basename(url));
   await downloadFile(url, zipFile);
 
   // 2. Extract to a temp dir, then move to the correct location.
@@ -303,8 +496,11 @@ async function installHeadlessSdk(
   const extracted = join(tmpDir, "cmdline-tools");
   if (existsSync(latestDest)) {
     // Overwrite: remove old one first
-    run("rm", ["-rf", latestDest]);          // Linux/macOS/WSL
-    run("powershell", ["-Command", `Remove-Item -Recurse -Force '${latestDest}'`]); // Windows
+    run("rm", ["-rf", latestDest]); // Linux/macOS/WSL
+    run("powershell", [
+      "-Command",
+      `Remove-Item -Recurse -Force '${latestDest}'`,
+    ]); // Windows
   }
   // Freshly-extracted files can still be transiently locked on Windows
   // (antivirus real-time scan of the newly written jars/exes) — retry the
@@ -315,7 +511,9 @@ async function installHeadlessSdk(
       renameSync(extracted, latestDest);
       break;
     } catch (e) {
-      const isLock = e instanceof Error && /EPERM|EBUSY/.test((e as NodeJS.ErrnoException).code ?? "");
+      const isLock =
+        e instanceof Error &&
+        /EPERM|EBUSY/.test((e as NodeJS.ErrnoException).code ?? "");
       if (!isLock || i >= 5) throw e;
       log.warn(`Extracted files still locked, retrying move (${i + 1}/5)…`);
       Bun.sleepSync(1_500);
@@ -349,12 +547,9 @@ async function installHeadlessSdk(
   const packages = ["platform-tools", "emulator", sysImage];
 
   log.info("Installing SDK packages:");
-  packages.forEach(p => log.info(`  ${p}`));
+  packages.forEach((p) => log.info(`  ${p}`));
 
-  const code = await runLive(sdkm, [
-    "--install",
-    ...packages,
-  ], { env: sdkEnv });
+  const code = await runLive(sdkm, ["--install", ...packages], { env: sdkEnv });
 
   if (code !== 0) throw new Error("sdkmanager failed installing packages.");
   log.good("SDK packages installed.");
@@ -387,11 +582,16 @@ export function systemImageInstalled(cfg: LabConfig): boolean {
  * directory name, not just android-37), so this is a plain string split,
  * not a re-parse into numeric fields.
  */
-export function systemImagePackageInstalled(sdkRoot: string, imagePackage: string): boolean {
+export function systemImagePackageInstalled(
+  sdkRoot: string,
+  imagePackage: string,
+): boolean {
   const parts = imagePackage.split(";"); // ["system-images", "android-37.0", "google_apis_playstore", "x86_64"]
   if (parts.length !== 4 || parts[0] !== "system-images") return false;
   const [, apiSegment, tag, abi] = parts;
-  return existsSync(join(sdkRoot, "system-images", apiSegment, tag, abi, "system.img"));
+  return existsSync(
+    join(sdkRoot, "system-images", apiSegment, tag, abi, "system.img"),
+  );
 }
 
 /** Emulator executable path inside the SDK. */
