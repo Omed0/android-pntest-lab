@@ -240,12 +240,41 @@ export class Adb {
       return true;
     }
 
-    // Overlay a tmpfs on the cacerts dir, repopulate with existing certs +
+    // Stage the existing system certs BEFORE mounting the tmpfs overlay, and
+    // verify the staged copy actually got them all. `cp ... || true` (as
+    // used here) silently swallows a partial-copy failure — mounting the
+    // overlay and repopulating from an incomplete staging directory would
+    // leave the device trusting only a handful of CAs (or none) from then
+    // on. A stock Android system trust store ships well over 100 CAs, so
+    // any real shortfall is easy to detect; every ordinary HTTPS site
+    // (anything using a real public CA, i.e. almost everything that isn't
+    // the proxy itself) would then fail TLS validation — indistinguishable
+    // to a user from "the app can't reach the server," a genuinely
+    // different problem from a proxy/DNS issue but with the same symptom.
+    const originalCount = parseInt(
+      this.rootShell("ls -1 /system/etc/security/cacerts/ 2>/dev/null | wc -l").trim(), 10,
+    ) || 0;
+    this.rootShell(
+      "mkdir -p /data/local/tmp/lab-cacerts; " +
+      "cp /system/etc/security/cacerts/* /data/local/tmp/lab-cacerts/ 2>/dev/null || true",
+    );
+    const stagedCount = parseInt(
+      this.rootShell("ls -1 /data/local/tmp/lab-cacerts/ 2>/dev/null | wc -l").trim(), 10,
+    ) || 0;
+    if (originalCount > 0 && stagedCount < originalCount) {
+      log.warn(
+        `System CA staging looks incomplete (staged ${stagedCount} of ${originalCount} certs) — ` +
+        "aborting the trust-store overlay rather than risk truncating it to just the proxy CA. " +
+        "Rerun `bun run init` to retry.",
+      );
+      this.rootShell(`rm -f ${tmpRemote}; rm -rf /data/local/tmp/lab-cacerts`);
+      return false;
+    }
+
+    // Overlay a tmpfs on the cacerts dir, repopulate with the staged certs +
     // ours, then fix ownership/permissions/SELinux context.
     const script = [
       "set -e",
-      "mkdir -p /data/local/tmp/lab-cacerts",
-      "cp /system/etc/security/cacerts/* /data/local/tmp/lab-cacerts/ 2>/dev/null || true",
       "mount -t tmpfs tmpfs /system/etc/security/cacerts",
       "cp /data/local/tmp/lab-cacerts/* /system/etc/security/cacerts/ 2>/dev/null || true",
       `cp ${tmpRemote} /system/etc/security/cacerts/${destName}`,
@@ -256,6 +285,16 @@ export class Adb {
       "rm -rf /data/local/tmp/lab-cacerts",
     ].join("; ");
     this.rootShell(script);
+
+    const restoredCount = parseInt(
+      this.rootShell("ls -1 /system/etc/security/cacerts/ 2>/dev/null | wc -l").trim(), 10,
+    ) || 0;
+    if (originalCount > 0 && restoredCount < originalCount) {
+      log.warn(
+        `System trust store has fewer certs after the overlay (${restoredCount} vs ${originalCount} before) — ` +
+        "ordinary HTTPS sites may fail TLS validation. Rerun \`bun run init\` to retry.",
+      );
+    }
 
     const ok = this.rootShell(`test -f /system/etc/security/cacerts/${destName} && echo YES || true`).trim() === "YES";
     return ok;

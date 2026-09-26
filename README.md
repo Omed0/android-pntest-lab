@@ -200,9 +200,12 @@ bun run init -- --proxy-tool=other --proxy-host=10.0.2.2 --proxy-port=8080
 bun run run -- --package=<pkg> --proxy-tool=other --proxy-host=10.0.2.2 --proxy-port=8080 --proxy-cert=.\mitmproxy-ca.pem
 ```
 
-**No proxy at all:** `--no-proxy` (alias `--no-burp`) skips proxy/cert setup —
-pass it to `init` to skip it there, and/or to `run` to skip it there too;
-they're independent.
+**No proxy at all:** `--no-proxy` (alias `--no-burp`) disables **both** proxy
+mechanisms — clears the device-global proxy (including any stale value from a
+prior session) and excludes `native-connect-hook.js` / `android-proxy-override.js`
+from the Frida chain, so apps get real internet access. All other unpinning and
+root-detection scripts still run. Pass it to `init` to skip it there, and/or to
+`run` to skip it there too; they're independent.
 
 **Clearing the proxy:** `bun run init -- --clear-proxy` (or `bun run run -- --clear-proxy`) resolves the target/proxy settings from the same config as everything else and clears the device's proxy — no hand-written `adb` commands needed. It's a standalone action; no other setup steps run alongside it.
 
@@ -593,15 +596,41 @@ bun run init -- --install-sdk
 Check serials and override with `LAB_TARGET_SERIAL`/`LAB_SOURCE_SERIAL`. All
 project ADB/Frida operations use the target serial explicitly.
 
-**Proxy is unreachable**
+**Proxy is unreachable — apps have no network access**
 
-Confirm your proxy tool listens on the configured address/port (bound to
-all interfaces, not just localhost), then:
+There are **two independent mechanisms** that route app traffic through the
+proxy, and both must be reachable or apps lose all connectivity:
+
+1. **Device-global proxy** — `settings put global http_proxy <host>:<port>`
+   applies to every proxy-aware app. `init`/`run` set this automatically and
+   now probe the host before setting it; if the proxy isn't reachable you'll
+   see a loud boxed warning. Traffic is still configured to go through the
+   proxy — no silent fallback to direct internet.
+
+2. **Frida forced-redirect scripts** — `native-connect-hook.js` intercepts
+   every raw TCP `connect()` on ports 80/443/8080/8443 and redirects to the
+   proxy, and `android-proxy-override.js` forces the JVM/ConnectivityManager
+   proxy setting. These work **independently of the device-global setting** and
+   independently of whether Burp is reachable.
+
+Both are disabled together by `--no-proxy` (which also clears any stale
+device proxy left from a prior session). If you pass `--no-proxy`, the cert-
+pinning and root-detection scripts still run — only the traffic-redirect
+scripts are skipped.
+
+To diagnose:
 
 ```powershell
+# Check device proxy value (":0" or "null" means cleared)
 adb -s $env:LAB_TARGET_SERIAL shell settings get global http_proxy
+
+# Run lab health checks
 bun run verify
 ```
+
+Confirm your proxy tool is bound to **all interfaces** (not just localhost /
+127.0.0.1), is running before `bun run run`, and is listening on the
+configured port (`--proxy-port`, default 8080).
 
 **Frida is unavailable**
 

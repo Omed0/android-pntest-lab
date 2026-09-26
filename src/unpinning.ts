@@ -20,11 +20,17 @@
 // equivalent) must be first: everything after it reads its top-level
 // `const CERT_PEM/PROXY_HOST/PROXY_PORT/DEBUG_MODE` declarations.
 
-import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, mkdirSync } from "fs";
+import {
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  readdirSync,
+  mkdirSync,
+} from "fs";
 import { join } from "path";
 import { log } from "./log.ts";
-import { getProxyCertificatePem } from "./proxy.ts";
 import { extractPrintableStrings } from "./secrets.ts";
+import { probeProxyReachable } from "./proxy.ts";
 
 const UNPINNING_DIR = "unpinning";
 
@@ -53,13 +59,105 @@ interface SignatureRule {
 }
 
 const DEX_SIGNATURES: SignatureRule[] = [
-  { label: "OkHttp CertificatePinner", status: "covered", needle: "Lokhttp3/CertificatePinner;" },
-  { label: "TrustKit", status: "covered", needle: "Lcom/datatheorem/android/trustkit/" },
-  { label: "Appmattus CertificateTransparency/pinning", status: "needs-custom", needle: "Lcom/appmattus/certificatetransparency/" },
-  { label: "Flutter http_certificate_pinning plugin", status: "verify-manually", needle: "Lcom/diefferson/http_certificate_pinning/" },
-  { label: "Flutter ssl_pinning_plugin", status: "verify-manually", needle: /Lcom\/macif\/plugin\/sslpinningplugin\//i },
-  { label: "Conscrypt custom TrustManager", status: "verify-manually", needle: "Lorg/conscrypt/" },
-  { label: "Custom X509TrustManager implementation", status: "needs-custom", needle: /L[\w/$]+;->checkServerTrusted/ },
+  // ── High-confidence library pinning ───────────────────────────────────────
+
+  {
+    label: "OkHttp CertificatePinner",
+    status: "covered",
+    needle: /(?:okhttp3|com\.squareup\.okhttp)[./]CertificatePinner/i,
+  },
+
+  {
+    label: "TrustKit",
+    status: "covered",
+    needle: /datatheorem.*trustkit/i,
+  },
+
+  {
+    label: "Appmattus Certificate Transparency / pinning",
+    status: "needs-custom",
+    needle: /appmattus.*certificatetransparency/i,
+  },
+
+  // ── Strong custom Java pinning indicators ─────────────────────────────────
+
+  {
+    label: "Custom X509TrustManager",
+    status: "needs-custom",
+    needle: /X509TrustManager/i,
+  },
+
+  {
+    label: "Custom checkServerTrusted implementation",
+    status: "needs-custom",
+    needle: /checkServerTrusted/i,
+  },
+
+  {
+    label: "HostnameVerifier",
+    status: "needs-custom",
+    needle: /HostnameVerifier/i,
+  },
+
+  // ── Android Network Security Config ───────────────────────────────────────
+
+  {
+    label: "Network Security Config pin-set",
+    status: "covered",
+    needle: /pin-set/i,
+  },
+
+  {
+    label: "Certificate digest reference",
+    status: "needs-custom",
+    needle: /sha256\/[A-Za-z0-9+/=]{20,}/i,
+  },
+
+  // ── Flutter / cross-platform ──────────────────────────────────────────────
+
+  {
+    label: "Flutter http_certificate_pinning",
+    status: "covered",
+    needle: /http[_-]?certificate[_-]?pinning/i,
+  },
+
+  {
+    label: "Flutter ssl_pinning_plugin",
+    status: "covered",
+    needle: /ssl[_-]?pinning[_-]?plugin/i,
+  },
+
+  {
+    label: "Cronet",
+    status: "verify-manually",
+    needle: /org\.chromium\.net\.CronetEngine|CronetEngine/i,
+  },
+
+  // ── Explicit pinning terminology ─────────────────────────────────────────
+
+  {
+    label: "Certificate pinning",
+    status: "needs-custom",
+    needle: /certificate.?pinning|cert.?pinning|public.?key.?pinning/i,
+  },
+
+  {
+    label: "Pinned certificate",
+    status: "needs-custom",
+    needle: /pinnedCertificate|pinnedCertificates|pinCertificates/i,
+  },
+
+  {
+    label: "Certificate hash comparison",
+    status: "needs-custom",
+    needle: /MessageDigest.*SHA-256|SHA-256.*certificate|digest.*certificate/i,
+  },
+
+  {
+    label: "Public key hash comparison",
+    status: "needs-custom",
+    needle: /public.?key.*hash|publicKey.*digest|pubkey.*sha256/i,
+  },
 ];
 
 /** Read a directory tree's file list (relative paths), skipping nothing — extract.ts already limits size via what it extracts. */
@@ -84,21 +182,28 @@ function walkFiles(dir: string): string[] {
  * the dex string pool) and, if present, network_security_config.xml and
  * AndroidManifest.xml for a static <pin-set>.
  */
-export function detectPinningSignatures(extractedDir: string): PinningSignature[] {
+export function detectPinningSignatures(
+  extractedDir: string,
+): PinningSignature[] {
   const found: PinningSignature[] = [];
   if (!existsSync(extractedDir)) return found;
 
   const files = walkFiles(extractedDir);
-  const dexFiles = files.filter(f => /classes\d*\.dex$/i.test(f));
+  const dexFiles = files.filter((f) => /classes\d*\.dex$/i.test(f));
   for (const dexFile of dexFiles) {
     const strings = extractPrintableStrings(readFileSync(dexFile));
     const haystack = strings.join("\n");
     for (const rule of DEX_SIGNATURES) {
-      const matched = typeof rule.needle === "string"
-        ? haystack.includes(rule.needle)
-        : rule.needle.test(haystack);
-      if (matched && !found.some(f => f.label === rule.label)) {
-        found.push({ label: rule.label, status: rule.status, evidence: `found in ${dexFile.slice(extractedDir.length + 1)}` });
+      const matched =
+        typeof rule.needle === "string"
+          ? haystack.includes(rule.needle)
+          : rule.needle.test(haystack);
+      if (matched && !found.some((f) => f.label === rule.label)) {
+        found.push({
+          label: rule.label,
+          status: rule.status,
+          evidence: `found in ${dexFile.slice(extractedDir.length + 1)}`,
+        });
       }
     }
   }
@@ -112,10 +217,10 @@ export function detectPinningSignatures(extractedDir: string): PinningSignature[
   // real AXML decoder (aapt2 dump xmltree / apktool / jadx -d without
   // --no-res) which this lab doesn't force a dependency on — point the user
   // there instead of guessing.
-  const nscPath = files.find(f => /network_security_config\.xml$/i.test(f));
+  const nscPath = files.find((f) => /network_security_config\.xml$/i.test(f));
   if (nscPath) {
     const strings = extractPrintableStrings(readFileSync(nscPath));
-    if (strings.some(s => /pin-set/i.test(s))) {
+    if (strings.some((s) => /pin-set/i.test(s))) {
       found.push({
         label: "Network Security Config <pin-set>",
         status: "covered",
@@ -128,34 +233,272 @@ export function detectPinningSignatures(extractedDir: string): PinningSignature[
 }
 
 /**
- * For every "needs-custom" signature, generate a starter stub in
- * scripts/custom/<pkg>.js documenting what was found — unless that file
- * already exists, in which case it's left alone (never overwrite a hand
- * edit). Returns the path if a new file was written, else null.
+ * Generate an automatic per-app dynamic Frida hook.
+ *
+ * This file is intentionally separate from scripts/custom/<pkg>.js:
+ *   <pkg>.auto.js -> generated and safe to overwrite on every extract
+ *   <pkg>.js     -> optional hand-written hook, never overwritten
+ *
+ * The generated hook:
+ * - hooks common Java pinning APIs
+ * - avoids replacing process-wide SSLContext/HostnameVerifier state
+ * - hooks OkHttp CertificatePinner
+ * - handles WebView SSL errors
+ * - dynamically scans loaded application/library classes
+ * - catches classes loaded after startup
+ *
+ * This is a heuristic dynamic layer, not a guarantee that arbitrary native
+ * or heavily protected pinning can always be bypassed.
  */
-export function generateCustomHookStub(labRoot: string, pkg: string, signatures: PinningSignature[]): string | null {
-  const needsCustom = signatures.filter(s => s.status === "needs-custom");
-  if (needsCustom.length === 0) return null;
-
+export function generateCustomHookStub(
+  labRoot: string,
+  pkg: string,
+  signatures: PinningSignature[],
+): string {
   const customDir = join(labRoot, "scripts", "custom");
-  const customPath = join(customDir, `${pkg}.js`);
-  if (existsSync(customPath)) return null;
+  const customPath = join(customDir, `${pkg}.auto.js`);
 
   mkdirSync(customDir, { recursive: true });
-  const stub = `// Auto-generated starter hook for ${pkg}
-// Generated by \`bun run extract\` because static analysis found pinning
-// techniques the default HTTPToolkit suite (scripts/unpinning/) doesn't
-// generically cover. Fill in the TODOs below, then re-run:
-//   bun run.ts --package=${pkg}
-//
-// Detected:
-${needsCustom.map(s => `//   - ${s.label} (${s.evidence})`).join("\n")}
 
-Java.perform(() => {
-${needsCustom.map(s => `  // TODO: hook the class/method backing "${s.label}" and force it to accept the connection.\n  // See scripts/unpinning/android/android-certificate-unpinning.js for the general pattern.`).join("\n\n")}
+  const detected = signatures.length
+    ? signatures
+        .map(
+          (s) =>
+            `//   - ${s.label} [${s.status}] — ${s.evidence.replace(/\r?\n/g, " ")}`,
+        )
+        .join("\n")
+    : "//   - No static pinning fingerprint matched; dynamic runtime discovery enabled.";
+
+  const pkgLiteral = JSON.stringify(pkg);
+
+  const script = `// AUTO-GENERATED BY ANDROID-PENTEST-LAB
+// Target package: ${pkg}
+// Do not edit this file manually.
+// It is regenerated by \`bun run extract\`.
+//
+// Detected during extraction:
+// ${detected}
+
+'use strict';
+
+const TARGET_PACKAGE = ${pkgLiteral};
+
+const hookedMethods = new Set();
+
+function log(msg) {
+  console.log('[AUTO-UNPIN] ' + msg);
+}
+
+function typeName(t) {
+  if (!t) return '';
+  return String(t.className || t.name || '');
+}
+
+function isBlockedSystemClass(name) {
+  return /^(java|javax|android|androidx|dalvik|sun|kotlin|kotlinx|com\\.android)\\./.test(name);
+}
+
+function looksInterestingClass(name) {
+  if (isBlockedSystemClass(name)) return false;
+
+  if (name.indexOf(TARGET_PACKAGE) === 0) {
+    return true;
+  }
+
+  return /(trust|pinning|pinner|certificate|cert|tls|ssl|hostname|verifier|security)/i.test(
+    name,
+  );
+}
+
+function safeUse(className) {
+  try {
+    return Java.use(className);
+  } catch (_) {
+    return null;
+  }
+}
+
+function hookOkHttpCertificatePinner(className) {
+  try {
+    const CertificatePinner = safeUse(className);
+    if (!CertificatePinner || !CertificatePinner.check) return;
+
+    for (const overload of CertificatePinner.check.overloads) {
+      const key =
+        className +
+        '.check(' +
+        (overload.argumentTypes || []).map(typeName).join(',') +
+        ')';
+
+      if (hookedMethods.has(key)) continue;
+
+      hookedMethods.add(key);
+
+      overload.implementation = function () {
+        log(className + '.check -> bypass');
+        return;
+      };
+    }
+
+    log('Hooked ' + className + '.CertificatePinner.check');
+  } catch (e) {
+    log(className + ' hook failed: ' + e);
+  }
+}
+
+function hookWebViewSslErrors() {
+  try {
+    const WebViewClient = Java.use('android.webkit.WebViewClient');
+
+    if (!WebViewClient.onReceivedSslError) return;
+
+    for (const overload of WebViewClient.onReceivedSslError.overloads) {
+      const args = overload.argumentTypes || [];
+
+      if (args.length !== 3) continue;
+
+      const key =
+        'WebViewClient.onReceivedSslError/' +
+        args.map(typeName).join(',');
+
+      if (hookedMethods.has(key)) continue;
+
+      hookedMethods.add(key);
+
+      overload.implementation = function (_view, handler, _error) {
+        try {
+          log('WebView onReceivedSslError -> proceed()');
+          handler.proceed();
+        } catch (e) {
+          log('WebView proceed() failed: ' + e);
+        }
+
+        return;
+      };
+    }
+
+    log('Hooked WebViewClient.onReceivedSslError');
+  } catch (e) {
+    log('WebView SSL error hook failed: ' + e);
+  }
+}
+
+function hookLoadedClass(className) {
+  if (!looksInterestingClass(className)) return;
+
+  const C = safeUse(className);
+  if (!C) return;
+
+  try {
+    if (C.checkServerTrusted) {
+      for (const overload of C.checkServerTrusted.overloads) {
+        const args = overload.argumentTypes || [];
+        const ret = typeName(overload.returnType);
+
+        const hasCertArray = args.some(function (a) {
+          return typeName(a).indexOf('X509Certificate') !== -1;
+        });
+
+        if (!hasCertArray || ret !== 'void') continue;
+
+        const key =
+          className +
+          '.checkServerTrusted(' +
+          args.map(typeName).join(',') +
+          ')';
+
+        if (hookedMethods.has(key)) continue;
+
+        hookedMethods.add(key);
+
+        overload.implementation = function () {
+          log(className + '.checkServerTrusted -> bypass');
+          return;
+        };
+      }
+    }
+  } catch (_) {
+    // Ignore classes that cannot be hooked.
+  }
+
+  try {
+    if (C.verify) {
+      for (const overload of C.verify.overloads) {
+        const args = overload.argumentTypes || [];
+        const ret = typeName(overload.returnType);
+
+        if (args.length !== 2 || ret !== 'boolean') continue;
+
+        const a0 = typeName(args[0]);
+        const a1 = typeName(args[1]);
+
+        const supported =
+          (a0 === 'java.lang.String' &&
+            a1 === 'javax.net.ssl.SSLSession') ||
+          (a0 === 'java.lang.String' &&
+            a1 === 'java.security.cert.X509Certificate');
+
+        if (!supported) continue;
+
+        const key =
+          className +
+          '.verify(' +
+          args.map(typeName).join(',') +
+          ')';
+
+        if (hookedMethods.has(key)) continue;
+
+        hookedMethods.add(key);
+
+        overload.implementation = function () {
+          log(className + '.verify -> true');
+          return true;
+        };
+      }
+    }
+  } catch (_) {
+    // Ignore classes that cannot be hooked.
+  }
+}
+
+function scanLoadedClasses() {
+  try {
+    const classes = Java.enumerateLoadedClassesSync();
+
+    for (const className of classes) {
+      if (looksInterestingClass(className)) {
+        hookLoadedClass(className);
+      }
+    }
+  } catch (e) {
+    log('Class enumeration failed: ' + e);
+  }
+}
+
+Java.perform(function () {
+  log('Dynamic app-specific pinning hook started for ' + TARGET_PACKAGE);
+  log('Compatibility mode: no global SSLContext/HostnameVerifier replacement');
+
+  // Keep the generated hook focused on app/library-specific pinning APIs.
+  // The vendored HTTPToolkit suite already handles the platform TLS path;
+  // replacing javax.net.ssl.SSLContext globally can interfere with apps that
+  // construct their own TLS stacks and can cause startup/initialization exits.
+  hookOkHttpCertificatePinner('okhttp3.CertificatePinner');
+  hookOkHttpCertificatePinner('com.squareup.okhttp.CertificatePinner');
+  hookWebViewSslErrors();
+
+  scanLoadedClasses();
+
+  // Catch libraries/classes loaded after startup.
+  setInterval(function () {
+    scanLoadedClasses();
+  }, 2000);
+
+  log('Dynamic pinning hook ready');
 });
 `;
-  writeFileSync(customPath, stub, "utf8");
+
+  writeFileSync(customPath, script, "utf8");
   return customPath;
 }
 
@@ -166,13 +509,32 @@ ${needsCustom.map(s => `  // TODO: hook the class/method backing "${s.label}" an
  * 4 top `const X = ...;` declarations in the real vendored file, in place,
  * and leaves everything else byte-for-byte as upstream shipped it.
  */
-function renderConfig(templatePath: string, certPem: string, proxyHost: string, proxyPort: number, debugMode: boolean): string {
+function renderConfig(
+  templatePath: string,
+  certPem: string,
+  proxyHost: string,
+  proxyPort: number,
+  debugMode: boolean,
+): string {
   let src = readFileSync(templatePath, "utf8");
   const escapedPem = certPem.replace(/\\/g, "\\\\").replace(/`/g, "\\`");
-  src = src.replace(/const CERT_PEM = `[\s\S]*?`;/, `const CERT_PEM = \`${escapedPem}\`;`);
-  src = src.replace(/const PROXY_HOST = '.*?';/, `const PROXY_HOST = ${JSON.stringify(proxyHost)};`);
-  src = src.replace(/const PROXY_PORT = \d+;/, `const PROXY_PORT = ${proxyPort};`);
-  src = src.replace(/const DEBUG_MODE = (true|false);/, `const DEBUG_MODE = ${debugMode ? "true" : "false"};`);
+  src = src.replace(
+    /const CERT_PEM = `[\s\S]*?`;/,
+    `const CERT_PEM = \`${escapedPem}\`;`,
+  );
+  // Match BOTH quote styles — the vendored template uses double quotes.
+  src = src.replace(
+    /const PROXY_HOST = ['"].*?['"];/,
+    `const PROXY_HOST = ${JSON.stringify(proxyHost)};`,
+  );
+  src = src.replace(
+    /const PROXY_PORT = \d+;/,
+    `const PROXY_PORT = ${proxyPort};`,
+  );
+  src = src.replace(
+    /const DEBUG_MODE = (true|false);/,
+    `const DEBUG_MODE = ${debugMode ? "true" : "false"};`,
+  );
   return src;
 }
 
@@ -189,22 +551,25 @@ function renderConfig(templatePath: string, certPem: string, proxyHost: string, 
  * project's own now-retired scripts/ssl-unpinning.js used to hardcode
  * per-app, e.g. the Tarik-Althuraya SSLContext.init crash workaround).
  */
-export function buildUnpinningScriptChain(
+export async function buildUnpinningScriptChain(
   labRoot: string,
   proxyHost: string,
   proxyPort: number,
   debugMode: boolean,
   pkg?: string,
-): string[] | null {
+  proxyDisabled = false,
+): Promise<string[] | null> {
   const scriptsDir = join(labRoot, "scripts", UNPINNING_DIR);
   const configTemplate = join(scriptsDir, "config.js");
   if (!existsSync(configTemplate)) {
-    log.warn(`Unpinning suite not found under ${scriptsDir} — falling back to --frida-script if given.`);
+    log.warn(
+      `Unpinning suite not found under ${scriptsDir} — falling back to --frida-script if given.`,
+    );
     return null;
   }
 
   const certPem = getProxyCertificatePem(labRoot);
-  if (!certPem) {
+  if (!certPem && !proxyDisabled) {
     log.warn(
       "No proxy CA available yet — the unpinning suite needs one to trust.\n" +
         "  Run `bun run init` first (it fetches/installs one automatically), or place a cert under cert/.",
@@ -212,28 +577,106 @@ export function buildUnpinningScriptChain(
     return null;
   }
 
-  const configPath = join(scriptsDir, "config.generated.js");
-  writeFileSync(configPath, renderConfig(configTemplate, certPem, proxyHost, proxyPort, debugMode), "utf8");
+  // native-connect-hook.js below forces every raw connect() on ports
+  // 80/443/8080/8443 to proxyHost:proxyPort, independently of the
+  // device-global proxy setting. If nothing's listening there, the attached
+  // app loses all connectivity the instant Frida loads it — with no sign of
+  // why, since the failing connections happen inside the hook. Same loud
+  // alert setDeviceProxy() prints, for the same reason; still proceeds,
+  // since this project's users want traffic routed through their proxy, not
+  // silently around it.
+  if (!proxyDisabled && !(await probeProxyReachable(proxyHost, proxyPort))) {
+    log.alert("PROXY NOT REACHABLE — this app will lose ALL network access", [
+      `Frida's native-connect-hook is about to redirect this app's connections to ${proxyHost}:${proxyPort},`,
+      "but nothing answered there from this machine. Start your proxy (bound to all interfaces),",
+      "then rerun. Proceeding anyway — pass --no-proxy if you want this app to skip the redirect instead.",
+    ]);
+  }
 
+  const configPath = join(scriptsDir, "config.generated.js");
+  writeFileSync(
+    configPath,
+    renderConfig(configTemplate, certPem ?? "", proxyHost, proxyPort, debugMode),
+    "utf8",
+  );
+
+  // --no-proxy means "don't force my traffic through a proxy" — that has
+  // to cover BOTH mechanisms this project uses to do that, not just the
+  // device-global `settings put global http_proxy` (src/proxy.ts). Without
+  // this, an app attached with the default chain still got every raw
+  // connect() on ports 80/443/8080/8443 redirected to burpHost:burpPort by
+  // native-connect-hook.js, and its JVM/ConnectivityManager proxy forced
+  // to the same address by android-proxy-override.js — independently of
+  // --no-proxy, and independently of whether that address was reachable at
+  // all. That's the confirmed root cause of apps losing all connectivity
+  // even after --no-proxy was passed to `bun run.ts`. The rest of the
+  // suite (pinning bypass, root-detection bypass) doesn't force a network
+  // redirect and still loads either way.
   const chain = [
     configPath,
-    join(scriptsDir, "native-connect-hook.js"),
+    ...(proxyDisabled ? [] : [join(scriptsDir, "native-connect-hook.js")]),
     join(scriptsDir, "native-tls-hook.js"),
-    join(scriptsDir, "android", "android-proxy-override.js"),
+    ...(proxyDisabled ? [] : [join(scriptsDir, "android", "android-proxy-override.js")]),
     join(scriptsDir, "android", "android-system-certificate-injection.js"),
     join(scriptsDir, "android", "android-certificate-unpinning.js"),
     join(scriptsDir, "android", "android-certificate-unpinning-fallback.js"),
     join(scriptsDir, "android", "android-disable-root-detection.js"),
-    join(scriptsDir, "android", "android-disable-flutter-certificate-pinning.js"),
+    join(
+      scriptsDir,
+      "android",
+      "android-disable-flutter-certificate-pinning.js",
+    ),
   ].filter(existsSync);
-
   if (pkg) {
-    const customPath = join(labRoot, "scripts", "custom", `${pkg}.js`);
-    if (existsSync(customPath)) {
-      log.good(`Custom per-app hook found: scripts/custom/${pkg}.js — loading after the unpinning suite.`);
-      chain.push(customPath);
+    const autoPath = join(labRoot, "scripts", "custom", `${pkg}.auto.js`);
+
+    if (existsSync(autoPath)) {
+      log.good(
+        `Automatic per-app hook found: scripts/custom/${pkg}.auto.js — loading after the unpinning suite.`,
+      );
+      chain.push(autoPath);
+    }
+
+    // Manual hook remains supported and is loaded last.
+    const manualPath = join(labRoot, "scripts", "custom", `${pkg}.js`);
+
+    if (existsSync(manualPath)) {
+      log.good(
+        `Manual per-app hook found: scripts/custom/${pkg}.js — loading last.`,
+      );
+      chain.push(manualPath);
     }
   }
 
   return chain;
+}
+
+/**
+ * Read the currently-available proxy CA (whatever findProxyCertificate()
+ * would find — .cer/.crt/.der/.pem under cert/, or --proxy-cert) as PEM
+ * text, converting from DER if needed. Returns null if no cert is
+ * available yet or it isn't a readable X.509 certificate. Used to feed
+ * CERT_PEM into the HTTPToolkit unpinning suite's generated config.js.
+ */
+function getProxyCertificatePem(labRoot: string): string | null {
+  const pemPath = join(labRoot, "cert", "burp-ca.pem");
+
+  if (!existsSync(pemPath)) {
+    log.warn(`Burp CA PEM not found: ${pemPath}`);
+    return null;
+  }
+
+  const pem = readFileSync(pemPath, "utf8").trim();
+
+  if (!pem.includes("-----BEGIN CERTIFICATE-----")) {
+    log.warn(`Invalid Burp CA PEM: ${pemPath}`);
+    return null;
+  }
+
+  if (!pem.includes("-----END CERTIFICATE-----")) {
+    log.warn(`Invalid Burp CA PEM: ${pemPath}`);
+    return null;
+  }
+
+  return pem;
 }

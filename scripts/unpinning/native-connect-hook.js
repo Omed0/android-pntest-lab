@@ -41,7 +41,7 @@
             'libsystem_c.dylib',      // iOS
             'libsystem_kernel.dylib' // iOS (syscall wrappers, e.g. fcntl)
         ].map((name) => Process.findModuleByName(name))
-         .filter((mod) => mod !== null);
+            .filter((mod) => mod !== null);
 
         if (systemModules.length === 0) throw new Error("Could not find any libc/libsystem module");
 
@@ -91,12 +91,14 @@
                 const port = portAddrBytes.getUint16(0, false); // Big endian!
 
                 const shouldBeIgnored = IGNORED_NON_HTTP_PORTS.includes(port);
-                const shouldBeBlocked = BLOCK_HTTP3 && !shouldBeIgnored && isUDP && port === 443;
+                const shouldBeBlocked =
+                    BLOCK_HTTP3 && !shouldBeIgnored && isUDP && port === 443;
 
-                // N.b for now we only support TCP interception - UDP direct should be doable,
-                // but SOCKS5 UDP would require a whole different flow. Rarely relevant, especially
-                // if you're blocking HTTP/3.
-                const shouldBeIntercepted = isTCP && !shouldBeIgnored && !shouldBeBlocked;
+
+                const shouldBeIntercepted =
+                    isTCP &&
+                    !shouldBeIgnored &&
+                    !shouldBeBlocked;
 
                 const hostBytes = isIPv6
                     // 16 bytes offset by 8 (2 for family, 2 for port, 4 for flowinfo):
@@ -124,8 +126,7 @@
                     }
 
                     if (DEBUG_MODE) {
-                        console.debug(`Blocking QUIC connection to ${
-                            getReadableAddress(hostBytes, isIPv6)}:${port}`);
+                        console.debug(`Blocking QUIC connection to ${getReadableAddress(hostBytes, isIPv6)}:${port}`);
                     }
                     this.state = 'Blocked';
                 } else if (shouldBeIntercepted) {
@@ -144,8 +145,7 @@
                     }
 
                     if (DEBUG_MODE) {
-                        console.log(`Manually intercepting ${sockType} connection to ${
-                            getReadableAddress(hostBytes, isIPv6)}:${port}`);
+                        console.log(`Manually intercepting ${sockType} connection to ${getReadableAddress(hostBytes, isIPv6)}:${port}`);
                     }
 
                     // Overwrite the port with the proxy port:
@@ -200,8 +200,7 @@
 
                 if (DEBUG_MODE) {
                     console.debug(handshakeSuccess
-                        ? `SOCKS redirect successful for fd ${this.sockFd} to ${
-                            getReadableAddress(host, isIPv6)}:${port}`
+                        ? `SOCKS redirect successful for fd ${this.sockFd} to ${getReadableAddress(host, isIPv6)}:${port}`
                         : `SOCKS redirect FAILED for fd ${this.sockFd}`
                     );
                 }
@@ -216,11 +215,9 @@
         }
     });
 
-    console.log(`== Redirecting ${
-        IGNORED_NON_HTTP_PORTS.length === 0
-        ? 'all'
-        : 'all unrecognized'
-    } TCP connections to ${PROXY_HOST}:${PROXY_PORT} ==`);
+    console.log(
+        `== Redirecting HTTP(S) TCP connections on ports 80, 443, 8080, 8443 to ${PROXY_HOST}:${PROXY_PORT} ==`
+    );
 
     const isIPv4Mapped = (/** @type {Uint8Array} */ hostBytes) =>
         hostBytes.length === 16 &&
@@ -238,7 +235,7 @@
 
         if (isIPv4Mapped(hostBytes)) {
             // IPv4-mapped IPv6 address - print as IPv4 for readability
-            return '::ffff:'+[...hostBytes.slice(12)].map(x => x.toString()).join('.');
+            return '::ffff:' + [...hostBytes.slice(12)].map(x => x.toString()).join('.');
         }
 
         else {
@@ -335,7 +332,7 @@
         const atyp = replyHeader.add(3).readU8();
         const addressLength = atyp === 0x01 ? 4 + 2   // IPv4 + port
             : atyp === 0x04 ? 16 + 2                  // IPv6 + port
-            : 0;
+                : 0;
 
         if (!addressLength) {
             // Hostnames (ATYP 3) are legal but rare & HTK never uses them, just reject

@@ -18,8 +18,8 @@ const CERT_PEM = `-----BEGIN CERTIFICATE-----
 -----END CERTIFICATE-----`;
 
 // Put your intercepting proxy's address here:
-const PROXY_HOST = '127.0.0.1';
-const PROXY_PORT = 8000;
+const PROXY_HOST = '10.0.2.2';
+const PROXY_PORT = 8080;
 
 // If you like, set to to true to enable extra logging:
 const DEBUG_MODE = false;
@@ -141,7 +141,7 @@ function pemToDer(input) {
     const pemLines = input.split('\n');
     if (
         pemLines[0] !== '-----BEGIN CERTIFICATE-----' ||
-        pemLines[pemLines.length- 1] !== '-----END CERTIFICATE-----'
+        pemLines[pemLines.length - 1] !== '-----END CERTIFICATE-----'
     ) {
         throw new Error(
             'Your certificate should be in PEM format, starting & ending ' +
@@ -186,11 +186,11 @@ function findLoadedModule(moduleName) {
         const module = Process.getModuleByName(moduleName);
         module.ensureInitialized();
         return module;
-    } catch (e) {}
+    } catch (e) { }
 
     try {
         return Module.load(moduleName);
-    } catch (e) {}
+    } catch (e) { }
 
     return null;
 }

@@ -2,12 +2,35 @@ import { existsSync } from "fs";
 import { rmSync } from "fs";
 import { run, runLive } from "./exec.ts";
 import { detectPlatform } from "./platform.ts";
-import { applyGpuConfig, bringEmulatorWindowToFront, ensureAvd, killEmulator, launchWindowsEmulator, listAvds, lockEmulatorWindow, repairAvdIdentity, resolveDeviceProfile, startEmulator } from "./avd.ts";
-import { avdmanagerPath, emulatorPath, ensureSdk, sdkmanagerPath, systemImagePackageInstalled } from "./sdk.ts";
+import {
+  applyGpuConfig,
+  bringEmulatorWindowToFront,
+  clearAvdProxyConfig,
+  ensureAvd,
+  killEmulator,
+  launchWindowsEmulator,
+  listAvds,
+  repairAvdIdentity,
+  resolveDeviceProfile,
+  startEmulator,
+} from "./avd.ts";
+import {
+  avdmanagerPath,
+  emulatorPath,
+  ensureSdk,
+  sdkmanagerPath,
+  systemImagePackageInstalled,
+  ensureBurpCertificatePem,
+} from "./sdk.ts";
 import { Adb, findAdb } from "./adb.ts";
 import { DEFAULTS, loadConfig, printConfig } from "./config.ts";
 import { ensureMagiskRoot } from "./magisk.ts";
-import { setDeviceProxy, ensureProxyCertificate, clearDeviceProxy, getDeviceProxy } from "./proxy.ts";
+import {
+  setDeviceProxy,
+  ensureProxyCertificate,
+  clearDeviceProxy,
+  getDeviceProxy,
+} from "./proxy.ts";
 import { fail, log } from "./log.ts";
 import {
   ensureFridaHost,
@@ -48,11 +71,21 @@ export function parseInitializeArgs(argv: string[]): InitializeOptions {
     if (!match) continue;
     const [, key, value] = match;
     switch (key) {
-      case "source-avd": options.sourceAvd = value ?? options.sourceAvd; break;
-      case "source-serial": options.sourceSerial = value ?? options.sourceSerial; break;
-      case "source-image-package": options.sourceImage = value ?? options.sourceImage; break;
-      case "skip-source": options.skipSource = true; break;
-      case "timeout": options.timeoutSec = Number(value); break;
+      case "source-avd":
+        options.sourceAvd = value ?? options.sourceAvd;
+        break;
+      case "source-serial":
+        options.sourceSerial = value ?? options.sourceSerial;
+        break;
+      case "source-image-package":
+        options.sourceImage = value ?? options.sourceImage;
+        break;
+      case "skip-source":
+        options.skipSource = true;
+        break;
+      case "timeout":
+        options.timeoutSec = Number(value);
+        break;
     }
   }
   return options;
@@ -91,7 +124,14 @@ Options
  *   produced real instability. Only the boot-timeout retry path passes an
  *   explicit override (cfg.sourceGpuMode).
  */
-function startSourceEmulator(emuPath: string, avdName: string, platformType: string, gpuModeOverride: string | undefined, showWindow: boolean, cacheDir: string): void {
+function startSourceEmulator(
+  emuPath: string,
+  avdName: string,
+  platformType: string,
+  gpuModeOverride: string | undefined,
+  showWindow: boolean,
+  cacheDir: string,
+): void {
   // Deliberately just "-avd <name>" and nothing else — matching Android
   // Studio's own Device Manager launch exactly, per the same reasoning as
   // omitting -gpu above. Earlier revisions also forced -no-boot-anim
@@ -103,17 +143,30 @@ function startSourceEmulator(emuPath: string, avdName: string, platformType: str
   // flags unchanged (it has no such quickboot-vs-coldboot problem).
   const args = ["-avd", avdName];
   if (gpuModeOverride) args.push("-gpu", gpuModeOverride);
-  log.info(`Starting source emulator: ${avdName}${gpuModeOverride ? ` (-gpu ${gpuModeOverride})` : " (default GPU mode, like Device Manager)"}`);
+  log.info(
+    `Starting source emulator: ${avdName}${gpuModeOverride ? ` (-gpu ${gpuModeOverride})` : " (default GPU mode, like Device Manager)"}`,
+  );
   if (platformType === "windows") {
     // See launchWindowsEmulator() in src/avd.ts for why this redirects
     // stdio instead of just setting -WindowStyle: it's what stops Windows
     // from also popping up a bare console/terminal window alongside the
     // emulator's own display window.
-    const pid = launchWindowsEmulator(emuPath, args, avdName, cacheDir, showWindow);
-    if (!pid) throw new Error("Could not start source emulator (no PID returned).");
+    const pid = launchWindowsEmulator(
+      emuPath,
+      args,
+      avdName,
+      cacheDir,
+      showWindow,
+    );
+    if (!pid)
+      throw new Error("Could not start source emulator (no PID returned).");
     return;
   }
-  Bun.spawn([emuPath, ...args], { stdout: "ignore", stderr: "ignore", stdin: "ignore" });
+  Bun.spawn([emuPath, ...args], {
+    stdout: "ignore",
+    stderr: "ignore",
+    stdin: "ignore",
+  });
 }
 
 /** Returns true if the AVD was actually created by this call (false if it already existed). */
@@ -135,11 +188,18 @@ async function ensureSourceAvd(
     // See src/sdk.ts installHeadlessSdk() for why --sdk_root=<path> must
     // never be passed on sdkmanager.bat's argv when <path> contains a space —
     // ANDROID_SDK_ROOT/ANDROID_HOME env vars carry it instead.
-    const imageCode = await runLive(sdkmanagerPath(sdkRoot, platform), [
-      "--install", imagePackage,
-    ], { env: { ANDROID_SDK_ROOT: sdkRoot, ANDROID_HOME: sdkRoot } });
-    if (imageCode !== 0 || !systemImagePackageInstalled(sdkRoot, imagePackage)) {
-      throw new Error(`Could not install source image '${imagePackage}'. Override --source-image-package.`);
+    const imageCode = await runLive(
+      sdkmanagerPath(sdkRoot, platform),
+      ["--install", imagePackage],
+      { env: { ANDROID_SDK_ROOT: sdkRoot, ANDROID_HOME: sdkRoot } },
+    );
+    if (
+      imageCode !== 0 ||
+      !systemImagePackageInstalled(sdkRoot, imagePackage)
+    ) {
+      throw new Error(
+        `Could not install source image '${imagePackage}'. Override --source-image-package.`,
+      );
     }
   }
   const avdmgr = avdmanagerPath(sdkRoot, platform);
@@ -151,11 +211,20 @@ async function ensureSourceAvd(
   // the newest available Pixel profile instead of hard-failing.
   const deviceId = resolveDeviceProfile(avdmgr, deviceProfile);
   const created = run(avdmgr, [
-    "create", "avd", "--name", avdName, "--package", imagePackage,
-    "--device", deviceId, "--force",
+    "create",
+    "avd",
+    "--name",
+    avdName,
+    "--package",
+    imagePackage,
+    "--device",
+    deviceId,
+    "--force",
   ]);
   if (!created.ok && !created.stdout.includes("created")) {
-    throw new Error(`Could not create source AVD:\n${created.stderr.trim() || created.stdout.trim()}`);
+    throw new Error(
+      `Could not create source AVD:\n${created.stderr.trim() || created.stdout.trim()}`,
+    );
   }
   // See repairAvdIdentity()'s doc comment in src/avd.ts: this project's
   // auto-installed avdmanager can't parse a decimal API level (e.g. the
@@ -171,7 +240,10 @@ async function ensureSourceAvd(
   return true;
 }
 
-export async function bootstrapLab(labRoot: string, argv: string[] = process.argv.slice(2)): Promise<void> {
+export async function bootstrapLab(
+  labRoot: string,
+  argv: string[] = process.argv.slice(2),
+): Promise<void> {
   const platform = detectPlatform();
   const cfg = loadConfig(labRoot, argv);
   console.log("\nAndroid Pentest Lab - bootstrap");
@@ -214,7 +286,9 @@ export async function bootstrapLab(labRoot: string, argv: string[] = process.arg
     // surfacing the original error, so a genuinely broken setup still fails
     // fast instead of retrying forever.
     if (!weStartedIt || cfg.gpuMode === "swiftshader_indirect") throw error;
-    log.warn("Emulator boot timed out — retrying once with software rendering (-gpu swiftshader_indirect), common on VMs like VMware…");
+    log.warn(
+      "Emulator boot timed out — retrying once with software rendering (-gpu swiftshader_indirect), common on VMs like VMware…",
+    );
     killEmulator(adb.exePath, cfg.targetSerial);
     Bun.sleepSync(3_000);
     await startEmulator(cfg, platform, "swiftshader_indirect");
@@ -233,7 +307,9 @@ export async function bootstrapLab(labRoot: string, argv: string[] = process.arg
   // properly enabled, switching to software rendering would make a working
   // display worse, and rendering never blocks Frida/ADB/proxy work anyway.
   if (weStartedIt && !adb.rendererHealthy()) {
-    log.warn("Emulator display renderer check did not pass (screencap failed). If the screen is black/white/grey, try --gpu-mode=swiftshader_indirect, or confirm hw.gpu.enabled=yes in the AVD's config.ini. Frida/ADB/proxy functionality is unaffected.");
+    log.warn(
+      "Emulator display renderer check did not pass (screencap failed). If the screen is black/white/grey, try --gpu-mode=swiftshader_indirect, or confirm hw.gpu.enabled=yes in the AVD's config.ini. Frida/ADB/proxy functionality is unaffected.",
+    );
   }
 
   log.step("Root");
@@ -250,7 +326,9 @@ export async function bootstrapLab(labRoot: string, argv: string[] = process.arg
     // original "genuinely unrooted, nothing more to try" case.
     if (!cfg.magiskRoot) throw error;
     alreadyRooted = false;
-    log.warn("adb-root unavailable (expected on a fresh Play Store image before Magisk is patched) — attempting Magisk root now…");
+    log.warn(
+      "adb-root unavailable (expected on a fresh Play Store image before Magisk is patched) — attempting Magisk root now…",
+    );
   }
   await ensureMagiskRoot(cfg, platform, adb);
   if (!alreadyRooted) {
@@ -261,11 +339,36 @@ export async function bootstrapLab(labRoot: string, argv: string[] = process.arg
     adb.verifyRoot();
   }
   const fridaVersion = await ensureFridaHost(cfg, platform);
+
   log.step("frida-server");
+
   const abi = adb.getAbi();
   log.info(`Device ABI: ${abi}`);
+
   const serverPath = await getFridaServer(fridaVersion, abi, cfg, platform);
-  await deployFridaServer(adb, serverPath, fridaVersion, cfg, platform, cfg.forceFrida);
+
+  // Generate cert/burp-ca.pem from cert/burp-ca.cer.
+  // This is consumed automatically by the Frida unpinning config.
+  log.step("Burp CA");
+
+  const burpPem = ensureBurpCertificatePem(labRoot);
+
+  if (burpPem) {
+    log.good(`Burp CA PEM ready: ${burpPem}`);
+  } else {
+    log.warn(
+      "Burp CA PEM is unavailable; Frida HTTPS interception config will not be generated.",
+    );
+  }
+
+  await deployFridaServer(
+    adb,
+    serverPath,
+    fridaVersion,
+    cfg,
+    platform,
+    cfg.forceFrida,
+  );
   log.step("Final check");
   verifyFridaConnection(cfg.targetSerial);
   log.good("Frida verified and working on target.");
@@ -286,19 +389,35 @@ export async function bootstrapLab(labRoot: string, argv: string[] = process.arg
   // something there still throws unexpectedly in the future.
   if (cfg.proxyEnabled) {
     try {
-      setDeviceProxy(adb, cfg.burpHost, cfg.burpPort, cfg.proxyTool);
-      await ensureProxyCertificate(adb, labRoot, platform, cfg.burpHost, cfg.burpPort, undefined, cfg.proxyTool);
+      await setDeviceProxy(adb, cfg.burpHost, cfg.burpPort, cfg.proxyTool);
+      await ensureProxyCertificate(
+        adb,
+        labRoot,
+        platform,
+        cfg.burpHost,
+        cfg.burpPort,
+        undefined,
+        cfg.proxyTool,
+      );
     } catch (error) {
       log.warn(
         `Proxy/certificate setup failed: ${error instanceof Error ? error.message : String(error)}\n` +
-        "  Root, Frida, and both emulators are still fully usable — rerun `bun run init` or `bun run.ts` to retry proxy setup.",
+          "  Root, Frida, and both emulators are still fully usable — rerun `bun run init` or `bun run.ts` to retry proxy setup.",
       );
     }
   } else {
-    log.info("Proxy setup skipped (--no-proxy).");
+    // A stale proxy from a *previous* `init` run must not silently outlive
+    // the run that turned proxying off — confirmed this was previously
+    // missing here (run.ts's --no-proxy path already clears it correctly;
+    // this one just logged "skipped" and left whatever value was already
+    // on the device in place indefinitely).
+    clearDeviceProxy(adb);
+    log.info("Proxy setup skipped (--no-proxy) — any previously-set device proxy was cleared.");
   }
 
-  log.good(`LAB READY: ${cfg.avdName} / Android ${adb.getAndroidVersion()} / Frida ${fridaVersion}`);
+  log.good(
+    `LAB READY: ${cfg.avdName} / Android ${adb.getAndroidVersion()} / Frida ${fridaVersion}`,
+  );
   // Raise + maximize the emulator window as the very last action, so none of
   // the root/frida/adb steps above (which steal focus) leave it buried.
   // Deliberately NOT gated on weStartedIt: ensureMagiskRoot() (or the
@@ -310,9 +429,13 @@ export async function bootstrapLab(labRoot: string, argv: string[] = process.arg
   if (cfg.showWindow) bringEmulatorWindowToFront(cfg.avdName);
 }
 
-export async function initializeLab(labRoot: string, argv: string[]): Promise<void> {
+export async function initializeLab(
+  labRoot: string,
+  argv: string[],
+): Promise<void> {
   const options = parseInitializeArgs(argv);
-  if (!Number.isFinite(options.timeoutSec) || options.timeoutSec <= 0) fail("--timeout must be positive.");
+  if (!Number.isFinite(options.timeoutSec) || options.timeoutSec <= 0)
+    fail("--timeout must be positive.");
   const platform = detectPlatform();
   const cfg = loadConfig(labRoot, argv);
 
@@ -324,7 +447,8 @@ export async function initializeLab(labRoot: string, argv: string[]): Promise<vo
     const sdkRoot = await ensureSdk(cfg, platform);
     const adb = findAdb(platform, sdkRoot, cfg.targetSerial);
     adb.startServer();
-    if (!adb.getEmulator()) fail(`No emulator visible to ADB on serial ${cfg.targetSerial}.`);
+    if (!adb.getEmulator())
+      fail(`No emulator visible to ADB on serial ${cfg.targetSerial}.`);
     const before = getDeviceProxy(adb);
     log.info(`Current proxy: ${before ?? "(none)"}`);
     clearDeviceProxy(adb);
@@ -333,16 +457,23 @@ export async function initializeLab(labRoot: string, argv: string[]): Promise<vo
 
   console.log("\nAndroid Pentest Lab - initialization");
   console.log(`  Rooted target: ${cfg.targetSerial} (${cfg.avdName})`);
-  console.log(`  Play Store source: ${options.sourceSerial} (${options.sourceAvd})\n`);
+  console.log(
+    `  Play Store source: ${options.sourceSerial} (${options.sourceAvd})\n`,
+  );
 
   const sdkRoot = await ensureSdk(cfg, platform);
   cfg.sdkRoot = sdkRoot;
   const adb = findAdb(platform, sdkRoot, cfg.targetSerial);
   adb.startServer();
-  const bootstrapArgs = argv.filter(arg =>
-    !arg.startsWith("--source-avd") && !arg.startsWith("--source-serial") &&
-    !arg.startsWith("--source-image-package") && !arg.startsWith("--skip-source") &&
-    !arg.startsWith("--timeout") && arg !== "--help" && arg !== "-h"
+  const bootstrapArgs = argv.filter(
+    (arg) =>
+      !arg.startsWith("--source-avd") &&
+      !arg.startsWith("--source-serial") &&
+      !arg.startsWith("--source-image-package") &&
+      !arg.startsWith("--skip-source") &&
+      !arg.startsWith("--timeout") &&
+      arg !== "--help" &&
+      arg !== "-h",
   );
   await bootstrapLab(labRoot, bootstrapArgs);
   if (options.skipSource) {
@@ -351,7 +482,8 @@ export async function initializeLab(labRoot: string, argv: string[]): Promise<vo
   }
 
   const emuPath = emulatorPath(sdkRoot, platform);
-  if (!existsSync(emuPath)) throw new Error(`Android Emulator not found: ${emuPath}`);
+  if (!existsSync(emuPath))
+    throw new Error(`Android Emulator not found: ${emuPath}`);
   let justCreated = false;
   if (!listAvds(emuPath).includes(options.sourceAvd)) {
     // Mirror the target's own gate in avd.ts ensureAvd(): only actually
@@ -362,13 +494,23 @@ export async function initializeLab(labRoot: string, argv: string[]): Promise<vo
     // the moment the AVD itself was missing, even when nothing needed
     // downloading, which is inconsistent with how the target behaves in the
     // exact same situation.
-    if (!cfg.installSdk && !systemImagePackageInstalled(sdkRoot, options.sourceImage)) {
+    if (
+      !cfg.installSdk &&
+      !systemImagePackageInstalled(sdkRoot, options.sourceImage)
+    ) {
       throw new Error(
         `Source AVD '${options.sourceAvd}' was not found and its system image (${options.sourceImage}) isn't installed yet.\n` +
-        "Rerun with: bun run init -- --install-sdk",
+          "Rerun with: bun run init -- --install-sdk",
       );
     }
-    justCreated = await ensureSourceAvd(sdkRoot, platform, emuPath, options.sourceAvd, options.sourceImage, cfg.sourceDeviceProfile);
+    justCreated = await ensureSourceAvd(
+      sdkRoot,
+      platform,
+      emuPath,
+      options.sourceAvd,
+      options.sourceImage,
+      cfg.sourceDeviceProfile,
+    );
   }
   // Enable GPU on the source AVD too — unconditionally, so a source AVD that
   // already existed from a prior run (ensureSourceAvd early-returns for it)
@@ -383,6 +525,7 @@ export async function initializeLab(labRoot: string, argv: string[]): Promise<vo
   // project's own earlier custom `-gpu`/window-lock handling on this AVD
   // produced the instability, not the absence of it.
   applyGpuConfig(options.sourceAvd);
+  clearAvdProxyConfig(options.sourceAvd);
   log.step("Play Store source");
   const sourceAdb = new Adb(adb.exePath, options.sourceSerial);
   if (sourceAdb.getEmulator()) {
@@ -400,7 +543,14 @@ export async function initializeLab(labRoot: string, argv: string[]): Promise<vo
     // So: force software rendering ONLY for that one first-ever cold boot;
     // every subsequent boot of this same AVD goes through the flagless path.
     const firstBootOverride = justCreated ? cfg.sourceGpuMode : undefined;
-    startSourceEmulator(emuPath, options.sourceAvd, platform.type, firstBootOverride, cfg.showWindow, cfg.cacheDir);
+    startSourceEmulator(
+      emuPath,
+      options.sourceAvd,
+      platform.type,
+      firstBootOverride,
+      cfg.showWindow,
+      cfg.cacheDir,
+    );
     try {
       sourceAdb.waitForBoot(options.timeoutSec);
     } catch (error) {
@@ -408,10 +558,19 @@ export async function initializeLab(labRoot: string, argv: string[]): Promise<vo
       // bootstrapLab() — covers a non-fresh AVD whose flagless boot still
       // times out for some other reason.
       if (firstBootOverride) throw error;
-      log.warn(`Source emulator boot timed out — retrying once with explicit -gpu ${cfg.sourceGpuMode}…`);
+      log.warn(
+        `Source emulator boot timed out — retrying once with explicit -gpu ${cfg.sourceGpuMode}…`,
+      );
       killEmulator(adb.exePath, options.sourceSerial);
       Bun.sleepSync(3_000);
-      startSourceEmulator(emuPath, options.sourceAvd, platform.type, cfg.sourceGpuMode, cfg.showWindow, cfg.cacheDir);
+      startSourceEmulator(
+        emuPath,
+        options.sourceAvd,
+        platform.type,
+        cfg.sourceGpuMode,
+        cfg.showWindow,
+        cfg.cacheDir,
+      );
       sourceAdb.waitForBoot(options.timeoutSec);
     }
 
@@ -444,7 +603,9 @@ function removeDirWithRetry(path: string, label: string): void {
         Bun.sleepSync(1_500 * (i + 1));
         continue;
       }
-      log.warn(`Could not fully remove ${label} (${path}): ${error instanceof Error ? error.message : String(error)}`);
+      log.warn(
+        `Could not fully remove ${label} (${path}): ${error instanceof Error ? error.message : String(error)}`,
+      );
       return;
     }
   }
@@ -475,7 +636,8 @@ export async function cleanLab(labRoot: string, argv: string[]): Promise<void> {
   log.step("Stopping emulator processes");
   if (platform.type === "windows") {
     run("powershell.exe", [
-      "-NoProfile", "-Command",
+      "-NoProfile",
+      "-Command",
       "Get-Process -Name 'qemu-system-*','emulator' -ErrorAction SilentlyContinue | Stop-Process -Force",
     ]);
   } else {
@@ -502,7 +664,9 @@ export async function cleanLab(labRoot: string, argv: string[]): Promise<void> {
   log.step("Deleting downloaded tools");
   removeDirWithRetry(cfg.toolsDir, "tools directory");
 
-  log.good("Clean complete. Run 'bun run init -- --install-sdk' to rebuild from scratch.");
+  log.good(
+    "Clean complete. Run 'bun run init -- --install-sdk' to rebuild from scratch.",
+  );
 }
 
 export function printLabHelp(): void {
@@ -548,7 +712,7 @@ async function main(): Promise<void> {
 }
 
 if (import.meta.main) {
-  main().catch(error => {
+  main().catch((error) => {
     fail(error instanceof Error ? error.message : String(error));
   });
 }

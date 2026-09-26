@@ -273,6 +273,54 @@ export async function ensureOpenSSL(
   return false;
 }
 
+// ── Burp CA PEM ───────────────────────────────────────────────────────────────
+
+export function ensureBurpCertificatePem(labRoot: string): string | null {
+  const certDir = join(labRoot, "cert");
+  const derPath = join(certDir, "burp-ca.cer");
+  const pemPath = join(certDir, "burp-ca.pem");
+
+  if (!existsSync(derPath)) {
+    log.warn(`Burp CA certificate not found: ${derPath}`);
+    return null;
+  }
+
+  // Already converted.
+  if (existsSync(pemPath)) {
+    const check = run("openssl", ["x509", "-in", pemPath, "-noout"]);
+
+    if (check.exitCode === 0) {
+      log.good(`Burp CA PEM already ready: ${pemPath}`);
+      return pemPath;
+    }
+  }
+
+  log.info("Converting Burp CA certificate DER → PEM…");
+
+  const result = run("openssl", [
+    "x509",
+    "-inform",
+    "DER",
+    "-in",
+    derPath,
+    "-out",
+    pemPath,
+  ]);
+
+  if (result.exitCode !== 0 || !existsSync(pemPath)) {
+    log.warn(
+      `Could not convert Burp CA to PEM: ${
+        result.stderr.trim() || result.stdout.trim() || "unknown OpenSSL error"
+      }`,
+    );
+    return null;
+  }
+
+  log.good(`Burp CA PEM ready: ${pemPath}`);
+
+  return pemPath;
+}
+
 // ── Android Studio (real, standard install — the opposite of --portable) ──────
 
 /**
@@ -334,6 +382,165 @@ export async function ensureAndroidStudio(cfg: LabConfig): Promise<void> {
       "Could not confirm Android Studio installed via winget; continuing without it (the CLI-managed SDK/AVDs are unaffected). Install manually with: winget install Google.AndroidStudio",
     );
   }
+}
+
+// ── JADX ──────────────────────────────────────────────────────────────────────
+
+function jadxExecutable(cfg: LabConfig, platform: PlatformInfo): string {
+  const cmd = platform.type === "windows" ? "jadx.bat" : "jadx";
+  return join(cfg.toolsDir, "jadx", "bin", cmd);
+}
+
+/**
+ * Ensure JADX is available when --install-sdk is requested.
+ *
+ * JADX is kept project-local under tools/jadx/ instead of being installed
+ * globally. This makes the pentest lab self-contained and avoids depending
+ * on the operator's PATH.
+ */
+// ── JADX ──────────────────────────────────────────────────────────────────────
+const JADX_VERSION = "1.5.6";
+const JADX_URL = `https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip`;
+
+function jadxPath(cfg: LabConfig, platform: PlatformInfo): string {
+  const exe = platform.type === "windows" ? "jadx.bat" : "jadx";
+  return join(cfg.toolsDir, "jadx", "bin", exe);
+}
+
+function activateJadx(jadxExe: string): void {
+  if (!existsSync(jadxExe)) return;
+
+  const binDir = dirname(jadxExe);
+  const sep = process.platform === "win32" ? ";" : ":";
+
+  const currentPath = process.env.PATH ?? "";
+  const alreadyPresent = currentPath
+    .split(sep)
+    .some((p) => p && p.toLowerCase() === binDir.toLowerCase());
+
+  if (!alreadyPresent) {
+    process.env.PATH = `${binDir}${sep}${currentPath}`;
+  }
+}
+
+/**
+ * Find an existing JADX installation.
+ *
+ * Search order:
+ *   1. JADX already on PATH
+ *   2. Project-local tools/jadx/bin/
+ *
+ * The explicit project-local check is important because Windows PATH may not
+ * be refreshed inside the current Bun process after an installation.
+ */
+export function findJadx(
+  cfg: LabConfig,
+  platform: PlatformInfo,
+): string | null {
+  const commands =
+    platform.type === "windows" ? ["jadx.bat", "jadx"] : ["jadx"];
+
+  for (const command of commands) {
+    const result = run(command, ["--version"]);
+    if (result.ok) {
+      return command;
+    }
+  }
+
+  const local = jadxPath(cfg, platform);
+
+  if (existsSync(local)) {
+    activateJadx(local);
+
+    if (run(local, ["--version"]).ok) {
+      return local;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Install JADX into:
+ *
+ *   tools/jadx/
+ *
+ * This is intentionally project-local rather than a global winget install.
+ * --install-sdk is the lab's "prepare missing development tools" switch.
+ */
+export async function ensureJadx(
+  cfg: LabConfig,
+  platform: PlatformInfo,
+): Promise<string | null> {
+  const existing = findJadx(cfg, platform);
+
+  if (existing) {
+    log.good(`JADX ready: ${existing}`);
+    return existing;
+  }
+
+  if (!cfg.installSdk) {
+    return null;
+  }
+
+  if (platform.type !== "windows") {
+    log.warn(
+      "JADX automatic installation is currently implemented for Windows.",
+    );
+    return null;
+  }
+
+  const installDir = join(cfg.toolsDir, "jadx");
+  const zipFile = join(cfg.cacheDir, `jadx-${JADX_VERSION}.zip`);
+
+  mkdirSync(installDir, { recursive: true });
+  mkdirSync(cfg.cacheDir, { recursive: true });
+
+  log.info(`Downloading JADX ${JADX_VERSION} into tools/jadx/…`);
+
+  await downloadFile(JADX_URL, zipFile);
+
+  /*
+   * JADX's official archive contains:
+   *
+   *   bin/
+   *   lib/
+   *
+   * Extracting into tools/jadx therefore produces:
+   *
+   *   tools/jadx/bin/jadx.bat
+   *   tools/jadx/bin/jadx-gui.bat
+   *   tools/jadx/lib/...
+   */
+  extractZip(zipFile, installDir, platform, cfg);
+
+  const installed = jadxPath(cfg, platform);
+
+  if (!existsSync(installed)) {
+    throw new Error(
+      `JADX installation completed, but executable was not found:\n${installed}`,
+    );
+  }
+
+  activateJadx(installed);
+
+  const versionCheck = run(installed, ["--version"]);
+
+  if (!versionCheck.ok) {
+    throw new Error(
+      `JADX was installed but could not be executed:\n` +
+        `${installed}\n\n` +
+        `${
+          versionCheck.stderr.trim() ||
+          versionCheck.stdout.trim() ||
+          "unknown error"
+        }`,
+    );
+  }
+
+  log.good(`JADX ${JADX_VERSION} ready: ${installed}`);
+
+  return installed;
 }
 
 // ── Cmdline-tools download URLs ───────────────────────────────────────────────
@@ -431,6 +638,7 @@ export async function ensureSdk(
   await ensureJava(cfg, platform);
   await ensure7z(cfg, platform);
   await ensureOpenSSL(cfg, platform);
+  await ensureJadx(cfg, platform);
   await ensureAndroidStudio(cfg);
 
   const existing = findSdk(cfg, platform);

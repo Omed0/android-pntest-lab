@@ -4,17 +4,21 @@
   "description": "Cross-platform Android mobile-pentesting lab — Bun/TypeScript (Windows · WSL · Linux)",
   "type": "module",
   "scripts": {
-    "init":       "bun src/lab.ts init",
-    "clean":      "bun src/lab.ts clean",
-    "run":        "bun run.ts",
-    "transfer":   "bun src/transfer.ts",
-    "apkinfo":    "bun src/apkinfo.ts",
-    "extract":    "bun src/extract.ts",
-    "verify":     "bun verify.ts",
-    "help":       "bun src/lab.ts help"
+    "init": "bun src/lab.ts init",
+    "clean": "bun src/lab.ts clean",
+    "run": "bun run.ts",
+    "transfer": "bun src/transfer.ts",
+    "apkinfo": "bun src/apkinfo.ts",
+    "extract": "bun src/extract.ts",
+    "verify": "bun verify.ts",
+    "help": "bun src/lab.ts help"
   },
   "devDependencies": {
     "@types/bun": "latest",
     "bun-types": "latest"
+  },
+  "private": true,
+  "peerDependencies": {
+    "typescript": "^5"
   }
 }

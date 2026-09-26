@@ -8,8 +8,10 @@
 
 import { copyFileSync, existsSync, mkdirSync, readdirSync, statSync } from "fs";
 import { join } from "path";
+import { createConnection } from "net";
 import { log } from "./log.ts";
 import { run, which } from "./exec.ts";
+import { ensureBurpCertificatePem } from "./sdk.ts";
 import type { findAdb } from "./adb.ts";
 import type { detectPlatform } from "./platform.ts";
 
@@ -35,9 +37,9 @@ function opensslAvailable(): boolean {
     if (!opensslPathCache) {
       log.warn(
         "openssl not found on PATH — needed to install/verify the proxy CA certificate.\n" +
-        "  Install it (Git for Windows bundles one, usually at <git>\\usr\\bin\\openssl.exe, or install OpenSSL\n" +
-        "  directly) and rerun `bun run init` / `bun run.ts`. Root, Frida, and both emulators are unaffected —\n" +
-        "  only HTTPS interception via the proxy CA needs this.",
+          "  Install it (Git for Windows bundles one, usually at <git>\\usr\\bin\\openssl.exe, or install OpenSSL\n" +
+          "  directly) and rerun `bun run init` / `bun run.ts`. Root, Frida, and both emulators are unaffected —\n" +
+          "  only HTTPS interception via the proxy CA needs this.",
       );
     }
   }
@@ -61,9 +63,25 @@ interface ParsedCertificate {
 function readCertificate(certPath: string): ParsedCertificate | null {
   if (!opensslAvailable()) return null;
   for (const format of ["DER", "PEM"] as const) {
-    const pemResult = run("openssl", ["x509", "-in", certPath, "-inform", format, "-outform", "PEM"]);
-    if (!pemResult.ok || !pemResult.stdout.includes("BEGIN CERTIFICATE")) continue;
-    const hashResult = run("openssl", ["x509", "-subject_hash_old", "-inform", format, "-in", certPath]);
+    const pemResult = run("openssl", [
+      "x509",
+      "-in",
+      certPath,
+      "-inform",
+      format,
+      "-outform",
+      "PEM",
+    ]);
+    if (!pemResult.ok || !pemResult.stdout.includes("BEGIN CERTIFICATE"))
+      continue;
+    const hashResult = run("openssl", [
+      "x509",
+      "-subject_hash_old",
+      "-inform",
+      format,
+      "-in",
+      certPath,
+    ]);
     const hash = hashResult.stdout
       .split(/\r?\n/)
       .map((line) => line.trim())
@@ -75,17 +93,52 @@ function readCertificate(certPath: string): ParsedCertificate | null {
 }
 
 /**
+ * Short-timeout TCP connect from the HOST to check whether a proxy listener
+ * is actually there — the same "10.0.2.2 is the emulator's alias for the
+ * host's own loopback, and the host itself can never reach that address"
+ * substitution already used for the CA download in downloadBurpCertificate()
+ * (confirmed directly there too). This is a plain reachability probe, not a
+ * protocol check — a listener that accepts the TCP connection but isn't
+ * actually an HTTP(S) proxy would still read as "reachable" here, same as
+ * any other TCP health check; that's an acceptable gap for a quick check
+ * that exists purely to catch the much more common "nothing is listening at
+ * all" case (Burp not started, wrong port, bound to the wrong interface).
+ */
+export async function probeProxyReachable(host: string, port: number, timeoutMs = 1500): Promise<boolean> {
+  const probeHost = host === "10.0.2.2" ? "127.0.0.1" : host;
+  return new Promise((resolve) => {
+    const socket = createConnection({ host: probeHost, port, timeout: timeoutMs });
+    const done = (ok: boolean) => {
+      socket.destroy();
+      resolve(ok);
+    };
+    socket.once("connect", () => done(true));
+    socket.once("timeout", () => done(false));
+    socket.once("error", () => done(false));
+  });
+}
+
+/**
  * Configure the emulator's global HTTP/HTTPS proxy to point at the
  * configured listener (Burp by default; any proxy tool works the same way).
  * Uses `adb shell settings put global http_proxy host:port`.
  * The emulator's default gateway 10.0.2.2 reaches the host machine.
+ *
+ * Always sets the value, even when the listener isn't reachable right now —
+ * this project deliberately never falls back to direct internet on its own:
+ * a user running this lab wants their traffic going through their proxy,
+ * full stop, and would rather see a loud warning and go fix Burp than have
+ * their capture silently stop happening. What changed is that this no
+ * longer fails silently: before, an unreachable proxy meant every app on
+ * the device lost all connectivity with nothing but a one-line "reminder"
+ * log easy to miss/scroll past — now it's a boxed, hard-to-miss alert.
  */
-export function setDeviceProxy(
+export async function setDeviceProxy(
   adb: ReturnType<typeof findAdb>,
   host: string,
   port: number,
   proxyTool: "burp" | "other",
-): void {
+): Promise<void> {
   log.step("Proxy");
   log.info(`Setting device proxy → ${host}:${port}`);
   adb.shell(`settings put global http_proxy ${host}:${port}`);
@@ -95,7 +148,20 @@ export function setDeviceProxy(
   } else {
     log.warn(`Proxy setting may not have taken effect (got: ${val})`);
   }
-  if (proxyTool === "burp") {
+
+  const reachable = await probeProxyReachable(host, port);
+  if (!reachable) {
+    log.alert("PROXY NOT REACHABLE — apps will lose ALL network access", [
+      `Nothing answered at ${host}:${port} from this machine.`,
+      proxyTool === "burp"
+        ? "Start Burp and set Proxy > Proxy Listeners > Binding address = All interfaces."
+        : "Start your proxy tool and confirm it's listening on all interfaces, not just 127.0.0.1.",
+      "The device proxy is set anyway (this lab never silently falls back to direct",
+      "internet) — every app's traffic will fail until the listener above is actually up.",
+      "Use --no-proxy to disable proxying entirely (device + Frida) if that's what you want instead.",
+    ]);
+  } else if (proxyTool === "burp") {
+    log.good(`Listener reachable at ${host}:${port}.`);
     log.info(
       "  Reminder: make sure Burp Suite is listening on all interfaces (0.0.0.0)",
     );
@@ -103,33 +169,23 @@ export function setDeviceProxy(
       `  Burp > Proxy > Proxy Listeners > Binding address = All interfaces, port ${port}`,
     );
   } else {
-    log.info(
-      `  Reminder: make sure your proxy tool is listening on ${host}:${port} (all interfaces).`,
-    );
+    log.good(`Listener reachable at ${host}:${port}.`);
   }
-}
-
-/**
- * Read the currently-available proxy CA (whatever findProxyCertificate()
- * would find — .cer/.crt/.der/.pem under cert/, or --proxy-cert) as PEM
- * text, converting from DER if needed. Returns null if no cert is
- * available yet or it isn't a readable X.509 certificate. Used to feed
- * CERT_PEM into the HTTPToolkit unpinning suite's generated config.js.
- */
-export function getProxyCertificatePem(labRoot: string, requestedPath?: string): string | null {
-  const certPath = findProxyCertificate(labRoot, requestedPath);
-  if (!certPath) return null;
-  return readCertificate(certPath)?.pem ?? null;
 }
 
 /**
  * Read back the device's current global HTTP/HTTPS proxy setting.
  * `adb shell settings get global http_proxy` prints "null" (not the string
- * "null" wrapped in anything special) when nothing is set.
+ * "null" wrapped in anything special) when nothing is set. `:0` is the
+ * OTHER "no proxy" sentinel — the one clearDeviceProxy() itself writes,
+ * since an empty string doesn't reliably clear the setting on every Android
+ * version. Confirmed live: without treating `:0` as "cleared" here too,
+ * clearDeviceProxy()'s own success path read back exactly what it just
+ * wrote and reported "may not have cleared" every single time it ran.
  */
 export function getDeviceProxy(adb: ReturnType<typeof findAdb>): string | null {
   const val = adb.shell("settings get global http_proxy").trim();
-  return val && val !== "null" ? val : null;
+  return val && val !== "null" && val !== ":0" ? val : null;
 }
 
 /**
@@ -150,7 +206,10 @@ export function clearDeviceProxy(adb: ReturnType<typeof findAdb>): void {
   }
 }
 
-export function findProxyCertificate(labRoot: string, requested?: string): string | null {
+export function findProxyCertificate(
+  labRoot: string,
+  requested?: string,
+): string | null {
   if (requested) return existsSync(requested) ? requested : null;
   const certDir = join(labRoot, "cert");
   if (!existsSync(certDir)) return null;
@@ -160,7 +219,11 @@ export function findProxyCertificate(labRoot: string, requested?: string): strin
   return name ? join(certDir, name) : null;
 }
 
-function downloadBurpCertificate(labRoot: string, host: string, port: number): string | null {
+function downloadBurpCertificate(
+  labRoot: string,
+  host: string,
+  port: number,
+): string | null {
   const certDir = join(labRoot, "cert");
   const certPath = join(certDir, "burp-ca.cer");
   mkdirSync(certDir, { recursive: true });
@@ -182,12 +245,18 @@ function downloadBurpCertificate(labRoot: string, host: string, port: number): s
   // host value (e.g. a LAN IP for a physical device) is already reachable
   // from both sides and is used as-is.
   const fetchHost = host === "10.0.2.2" ? "127.0.0.1" : host;
-  log.info(`Downloading Burp CA from http://burp/cert via ${fetchHost}:${port}…`);
+  log.info(
+    `Downloading Burp CA from http://burp/cert via ${fetchHost}:${port}…`,
+  );
   const result = run("curl", [
-    "--fail", "--silent", "--show-error",
-    "--proxy", `http://${fetchHost}:${port}`,
+    "--fail",
+    "--silent",
+    "--show-error",
+    "--proxy",
+    `http://${fetchHost}:${port}`,
     "http://burp/cert",
-    "--output", certPath,
+    "--output",
+    certPath,
   ]);
   if (result.ok && existsSync(certPath) && statSync(certPath).size > 0) {
     // curl succeeding and writing a non-empty file only proves *something*
@@ -203,13 +272,15 @@ function downloadBurpCertificate(labRoot: string, host: string, port: number): s
     if (opensslAvailable()) {
       log.warn(
         `Burp responded on ${fetchHost}:${port} but the content doesn't look like a certificate — ` +
-        `is Burp actually running and is that really its proxy listener?`,
+          `is Burp actually running and is that really its proxy listener?`,
       );
     }
     return null;
   }
 
-  log.warn(`Could not download Burp CA automatically: ${result.stderr.trim() || "Burp listener did not respond"}`);
+  log.warn(
+    `Could not download Burp CA automatically: ${result.stderr.trim() || "Burp listener did not respond"}`,
+  );
   return null;
 }
 
@@ -221,7 +292,10 @@ function downloadBurpCertificate(labRoot: string, host: string, port: number): s
  * reason (openssl missing vs. genuinely not a certificate) was already
  * logged by readCertificate()/opensslAvailable().
  */
-function prepareAndroidCertificate(labRoot: string, certPath: string): { hash: string; derPath: string } | null {
+function prepareAndroidCertificate(
+  labRoot: string,
+  certPath: string,
+): { hash: string; derPath: string } | null {
   const info = readCertificate(certPath);
   if (!info) {
     if (opensslAvailable()) {
@@ -234,7 +308,15 @@ function prepareAndroidCertificate(labRoot: string, certPath: string): { hash: s
   if (info.format === "DER") {
     if (certPath !== derPath) copyFileSync(certPath, derPath);
   } else {
-    const convert = run("openssl", ["x509", "-in", certPath, "-outform", "DER", "-out", derPath]);
+    const convert = run("openssl", [
+      "x509",
+      "-in",
+      certPath,
+      "-outform",
+      "DER",
+      "-out",
+      derPath,
+    ]);
     if (!convert.ok) {
       log.warn(`Could not convert Burp CA to DER: ${convert.stderr.trim()}`);
       return null;
@@ -267,7 +349,9 @@ export async function ensureProxyCertificate(
   // wouldn't answer there, so skip straight to the manual/--proxy-cert path
   // when the user has told us they're not using Burp.
   const autoDownload = () =>
-    proxyTool === "burp" ? downloadBurpCertificate(labRoot, burpHost, burpPort) : null;
+    proxyTool === "burp"
+      ? downloadBurpCertificate(labRoot, burpHost, burpPort)
+      : null;
 
   let certPath = findProxyCertificate(labRoot, requestedPath) ?? autoDownload();
   if (!certPath) {
@@ -277,19 +361,29 @@ export async function ensureProxyCertificate(
         : "Proxy CA was not found under cert/.",
     );
     if (proxyTool === "burp") {
-      log.info("Export Burp's CA from http://burp/cert and save it as cert/burp-ca.cer.");
+      log.info(
+        "Export Burp's CA from http://burp/cert and save it as cert/burp-ca.cer.",
+      );
     } else {
-      log.info("Export your proxy tool's CA certificate and save it under cert/ (any .cer/.crt/.der/.pem file).");
+      log.info(
+        "Export your proxy tool's CA certificate and save it under cert/ (any .cer/.crt/.der/.pem file).",
+      );
     }
-    log.info("Alternatively pass --proxy-cert=<path> to use a certificate elsewhere.");
-    const answer = prompt("After placing the certificate, type y to retry (or anything else to skip): ");
+    log.info(
+      "Alternatively pass --proxy-cert=<path> to use a certificate elsewhere.",
+    );
+    const answer = prompt(
+      "After placing the certificate, type y to retry (or anything else to skip): ",
+    );
     if (answer?.trim().toLowerCase() !== "y") {
       log.warn("Proxy CA setup skipped. No certificate was provided.");
       return;
     }
     certPath = findProxyCertificate(labRoot, requestedPath) ?? autoDownload();
     if (!certPath) {
-      log.warn("Proxy CA is still missing. Save it under cert/ and rerun (bun run init or bun run.ts).");
+      log.warn(
+        "Proxy CA is still missing. Save it under cert/ and rerun (bun run init or bun run.ts).",
+      );
       return;
     }
   }
@@ -298,7 +392,7 @@ export async function ensureProxyCertificate(
   if (!prepared) {
     log.warn(
       "Proxy CA setup skipped — root, Frida, and both emulators are unaffected; " +
-      "fix the certificate (see the warning above) and rerun `bun run init` or `bun run.ts` to enable HTTPS interception.",
+        "fix the certificate (see the warning above) and rerun `bun run init` or `bun run.ts` to enable HTTPS interception.",
     );
     return;
   }
@@ -312,8 +406,12 @@ export async function ensureProxyCertificate(
   // missing/bad certificate above already does — not take down an
   // otherwise-fully-successful `bun run init` (root + Frida already done).
   try {
-    log.info(`Installing into system trust store as ${hash}.0 (tmpfs overlay, no writable-system/reboot)…`);
-    const ok = adb.installSystemCert(derPath, hash, (local, remote) => adb.push(local, remote, platform));
+    log.info(
+      `Installing into system trust store as ${hash}.0 (tmpfs overlay, no writable-system/reboot)…`,
+    );
+    const ok = adb.installSystemCert(derPath, hash, (local, remote) =>
+      adb.push(local, remote, platform),
+    );
 
     // Also push the same DER cert to a fixed, well-known path — this is the
     // exact file the classic "frida-android-repinning.js"-style scripts
@@ -325,7 +423,9 @@ export async function ensureProxyCertificate(
     const REPIN_CERT_PATH = "/data/local/tmp/cert-der.crt";
     adb.push(derPath, REPIN_CERT_PATH, platform);
     adb.shell(`chmod 644 ${REPIN_CERT_PATH}`);
-    log.good(`CA also pushed to ${REPIN_CERT_PATH} (for repinning-style Frida scripts).`);
+    log.good(
+      `CA also pushed to ${REPIN_CERT_PATH} (for repinning-style Frida scripts).`,
+    );
 
     if (!ok) {
       log.warn(
@@ -336,11 +436,23 @@ export async function ensureProxyCertificate(
       );
       return;
     }
-    log.good(`Proxy system CA installed: /system/etc/security/cacerts/${hash}.0`);
+    log.good(
+      `Proxy system CA installed: /system/etc/security/cacerts/${hash}.0`,
+    );
   } catch (error) {
     log.warn(
       `Proxy CA install failed: ${error instanceof Error ? error.message : String(error)}\n` +
-      "  Root, Frida, and both emulators are unaffected — rerun `bun run init` or `bun run.ts` to retry.",
+        "  Root, Frida, and both emulators are unaffected — rerun `bun run init` or `bun run.ts` to retry.",
     );
   }
+
+  // The Frida unpinning suite reads cert/burp-ca.pem via
+  // getProxyCertificatePem() in src/unpinning.ts. That .pem file is only
+  // ever produced by ensureBurpCertificatePem(), which otherwise runs once
+  // during bootstrapLab() — *before* this function, and therefore before
+  // cert/burp-ca.cer exists on a fresh install, meaning the first
+  // `bun run init` used to skip the entire unpinning chain silently.
+  // Generating the .pem here, at the one point where .cer is guaranteed
+  // to exist, closes that gap permanently.
+  ensureBurpCertificatePem(labRoot);
 }

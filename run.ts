@@ -20,7 +20,7 @@
 //
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { existsSync } from "fs";
+import { existsSync, readdirSync } from "fs";
 import { log, fail } from "./src/log.ts";
 import { detectPlatform } from "./src/platform.ts";
 import { DEFAULTS, loadConfig, printConfig } from "./src/config.ts";
@@ -43,6 +43,7 @@ import {
 import { run, runLive } from "./src/exec.ts";
 import { ensureOpenSSL } from "./src/sdk.ts";
 import { packageInstalled as sharedPackageInstalled } from "./src/apkpull.ts";
+import { basename, dirname, join } from "path";
 
 // ── Run-specific CLI options ──────────────────────────────────────────────────
 
@@ -55,7 +56,7 @@ interface RunOptions {
   burpCert?: string;
   burp: boolean;
   proxyTool: "burp" | "other";
-  spawnMode: boolean; // --spawn: use frida --spawn instead of attaching
+  spawnMode: boolean; // default true (spawn); --no-spawn attaches to an already-running process instead
   verbose: boolean;
   clearProxy: boolean;
   noUnpinning: boolean;
@@ -65,7 +66,7 @@ function parseRunArgs(argv: string[]): RunOptions {
   const opts: RunOptions = {
     burp: true,
     proxyTool: "burp",
-    spawnMode: false,
+    spawnMode: true,
     verbose: false,
     clearProxy: false,
     noUnpinning: false,
@@ -100,8 +101,10 @@ function parseRunArgs(argv: string[]): RunOptions {
       case "proxy-cert":
         opts.burpCert = val;
         break;
-      case "no-burp":
       case "no-proxy":
+        opts.burp = false;
+        break;
+      case "no-burp":
         opts.burp = false;
         break;
       case "proxy-tool":
@@ -115,6 +118,9 @@ function parseRunArgs(argv: string[]): RunOptions {
         break;
       case "spawn":
         opts.spawnMode = true;
+        break;
+      case "no-spawn":
+        opts.spawnMode = false;
         break;
       case "verbose":
       case "v":
@@ -154,7 +160,10 @@ function printRunHelp(): void {
                             Set to "other" when using a non-Burp proxy tool —
                             skips the Burp-only auto-download and goes straight
                             to cert/ or --proxy-cert=<path>.
-  --no-proxy                Skip proxy configuration on device entirely
+  --no-proxy                Don't force traffic through a proxy at all: skips the device-global
+                            proxy setting AND excludes the two Frida scripts that would otherwise
+                            redirect this app's traffic to it (native-connect-hook,
+                            android-proxy-override) — the rest of the unpinning suite still loads.
                             (alias: --no-burp)
   --clear-proxy             Clear the device's proxy setting and exit
                             immediately (no package/APK/Frida steps run).
@@ -162,6 +171,8 @@ function printRunHelp(): void {
                             from config, same as everything else — no need
                             to hand-run adb yourself.
   --spawn                   Use frida --spawn instead of attaching to running process
+                          (default is spawn; combine with --no-spawn for the opposite)
+  --no-spawn                Attach to an already-running process instead of spawning
   --verbose, -v             Print extra debug output
   --help, -h                Show this help
 
@@ -207,9 +218,55 @@ function installApk(adb: ReturnType<typeof findAdb>, apkPath: string): void {
   if (!existsSync(apkPath)) {
     throw new Error(`APK not found: ${apkPath}`);
   }
-  log.info(`Installing ${apkPath}…`);
+
   const serialArgs = adb.serial ? ["-s", adb.serial] : [];
-  const r = run(adb.exePath, [...serialArgs, "install", "-r", "-t", apkPath]);
+
+  // Detect split APK sets: if the APK lives alongside sibling
+  // split_config.*.apk files, install them together. PairIP-protected
+  // apps (com.pairip.licensecheck) also require the Play Store installer
+  // name, otherwise LicenseActivity fires on first launch and the app
+  // calls System.exit(0) before showing any UI.
+  const dir = dirname(apkPath);
+  const baseName = basename(apkPath);
+  let siblings: string[] = [];
+  if (/^base\.apk$/i.test(baseName)) {
+    try {
+      siblings = readdirSync(dir)
+        .filter((f) => /^split_config\..*\.apk$/i.test(f))
+        .map((f) => join(dir, f));
+    } catch {
+      siblings = [];
+    }
+  }
+
+  log.info(
+    `Installing ${apkPath}${siblings.length ? ` (+${siblings.length} splits)` : ""}…`,
+  );
+
+  let r;
+  if (siblings.length > 0) {
+    r = run(adb.exePath, [
+      ...serialArgs,
+      "install-multiple",
+      "-r",
+      "-t",
+      "-i",
+      "com.android.vending",
+      apkPath,
+      ...siblings,
+    ]);
+  } else {
+    r = run(adb.exePath, [
+      ...serialArgs,
+      "install",
+      "-r",
+      "-t",
+      "-i",
+      "com.android.vending",
+      apkPath,
+    ]);
+  }
+
   if (!r.ok || r.stdout.includes("Failure")) {
     throw new Error(
       `APK install failed:\n${r.stderr.trim() || r.stdout.trim()}`,
@@ -359,6 +416,7 @@ async function attachFrida(
   extraScript: string | undefined,
   spawnMode: boolean,
   verbose: boolean,
+  proxyDisabled: boolean,
 ): Promise<void> {
   log.step("Frida attach");
 
@@ -388,24 +446,36 @@ async function attachFrida(
     args.push("-f", pkg);
     log.info(`Spawning ${pkg} under Frida…`);
   } else {
+    // Do not pass a PID discovered by pidof to Frida. The app can restart or
+    // exit in the small gap between pidof and Frida's attach, leaving a stale
+    // PID and producing:
+    //   Failed to attach: unable to find process with pid <n>
+    //
+    // Frida's -n resolves the live process by name at attach time, which avoids
+    // that PID race. Keep the wait so an app that never starts gets a useful
+    // error before invoking Frida.
     const pid = waitForAppPid(adb, pkg);
-    if (pid) {
-      args.push("-p", pid);
-      log.info(`Attaching to ${pkg} (PID=${pid})…`);
-    } else {
-      args.push("-n", pkg);
-      log.info(`Attaching to ${pkg} by name…`);
+
+    if (!pid) {
+      throw new Error(
+        `Target process '${pkg}' did not appear within 10s. ` +
+          "The app may have crashed immediately after launch; check logcat and rerun.",
+      );
     }
+
+    args.push("-n", pkg);
+    log.info(`Attaching to ${pkg} by name (current PID=${pid})…`);
   }
 
   const scriptChain: string[] = [];
   if (!noUnpinning) {
-    const chain = buildUnpinningScriptChain(
+    const chain = await buildUnpinningScriptChain(
       labRoot,
       burpHost,
       burpPort,
       verbose,
       pkg,
+      proxyDisabled,
     );
     if (chain) {
       scriptChain.push(...chain);
@@ -439,8 +509,23 @@ async function attachFrida(
     stdin: "inherit",
   });
   const code = await proc.exited;
+
+  // Frida can return non-zero when the target process disappears while
+  // attached. That is different from Frida itself failing to start/attach.
+  // Check the target state before converting the exit into a lab error.
   if (code !== 0) {
-    throw new Error(`frida exited with code ${code}`);
+    const targetPidAfterExit = getAppPid(adb, pkg);
+    if (!targetPidAfterExit) {
+      log.warn(
+        `Frida ended with code ${code}, and target '${pkg}' is no longer running. ` +
+          "Treating this as target-process termination, not a Frida startup/attach failure.",
+      );
+      return;
+    }
+
+    throw new Error(
+      `frida exited with code ${code} while target '${pkg}' was still running.`,
+    );
   }
 }
 
@@ -476,6 +561,7 @@ async function main(): Promise<void> {
     const before = getDeviceProxy(adb);
     log.info(`Current proxy: ${before ?? "(none)"}`);
     clearDeviceProxy(adb);
+    log.good("Proxy cleared.");
     return;
   }
 
@@ -557,7 +643,7 @@ async function main(): Promise<void> {
     // even though the child process inherited the old PATH from the shell.
     await ensureOpenSSL(cfg, platform);
 
-    setDeviceProxy(adb, cfg.burpHost, cfg.burpPort, runOpts.proxyTool);
+    await setDeviceProxy(adb, cfg.burpHost, cfg.burpPort, runOpts.proxyTool);
     await ensureProxyCertificate(
       adb,
       labRoot,
@@ -568,7 +654,13 @@ async function main(): Promise<void> {
       runOpts.proxyTool,
     );
   } else {
-    log.info("Proxy setup skipped (--no-proxy).");
+    const existing = getDeviceProxy(adb);
+    if (existing) {
+      log.info(`--no-proxy: clearing stale proxy (${existing}).`);
+      clearDeviceProxy(adb);
+    } else {
+      log.info("Proxy setup skipped (--no-proxy).");
+    }
   }
 
   // ── 5. APK install ─────────────────────────────────────────────────────────
@@ -633,6 +725,7 @@ async function main(): Promise<void> {
     extraScript,
     runOpts.spawnMode,
     runOpts.verbose,
+    !runOpts.burp,
   );
 }
 

@@ -4,7 +4,12 @@ import { join } from "path";
 import { homedir } from "os";
 import { log } from "./log.ts";
 import { run, runLive } from "./exec.ts";
-import { avdmanagerPath, emulatorPath, sdkmanagerPath, systemImageInstalled } from "./sdk.ts";
+import {
+  avdmanagerPath,
+  emulatorPath,
+  sdkmanagerPath,
+  systemImageInstalled,
+} from "./sdk.ts";
 import type { LabConfig } from "./config.ts";
 import type { PlatformInfo } from "./platform.ts";
 
@@ -15,7 +20,7 @@ export function listAvds(emuPath: string): string[] {
   const r = run(emuPath, ["-list-avds"]);
   return r.stdout
     .split(/\r?\n/)
-    .map(l => l.trim())
+    .map((l) => l.trim())
     .filter(Boolean);
 }
 
@@ -54,21 +59,34 @@ function listDeviceIds(avdmgr: string): string[] {
  * "pixel_*_pro" -> the newest available "pixel_*" -> the first device id
  * this avdmanager knows about at all.
  */
-export function resolveDeviceProfile(avdmgr: string, preferred: string): string {
+export function resolveDeviceProfile(
+  avdmgr: string,
+  preferred: string,
+): string {
   const ids = listDeviceIds(avdmgr);
   if (ids.length === 0) return preferred; // avdmanager list failed to parse — let create avd surface the real error
 
   if (ids.includes(preferred)) return preferred;
 
-  const byNewestPixelNumber = (candidates: string[]) => candidates
-    .map(id => ({ id, n: parseInt(id.match(/pixel_(\d+)/)?.[1] ?? "-1", 10) }))
-    .sort((a, b) => b.n - a.n)[0]?.id;
+  const byNewestPixelNumber = (candidates: string[]) =>
+    candidates
+      .map((id) => ({
+        id,
+        n: parseInt(id.match(/pixel_(\d+)/)?.[1] ?? "-1", 10),
+      }))
+      .sort((a, b) => b.n - a.n)[0]?.id;
 
-  const pixelPro = byNewestPixelNumber(ids.filter(id => /^pixel_\d+.*_pro$/.test(id)));
-  const pixelAny = byNewestPixelNumber(ids.filter(id => /^pixel_\d+/.test(id)));
+  const pixelPro = byNewestPixelNumber(
+    ids.filter((id) => /^pixel_\d+.*_pro$/.test(id)),
+  );
+  const pixelAny = byNewestPixelNumber(
+    ids.filter((id) => /^pixel_\d+/.test(id)),
+  );
   const fallback = pixelPro ?? pixelAny ?? ids[0];
 
-  log.warn(`Device profile '${preferred}' is not on this SDK's device list — using '${fallback}' instead.`);
+  log.warn(
+    `Device profile '${preferred}' is not on this SDK's device list — using '${fallback}' instead.`,
+  );
   return fallback;
 }
 
@@ -91,7 +109,7 @@ export async function ensureAvd(
   if (!existsSync(emuPath)) {
     throw new Error(
       `emulator not found: ${emuPath}\n` +
-      "Run bootstrap with --install-sdk to install the Android Emulator.",
+        "Run bootstrap with --install-sdk to install the Android Emulator.",
     );
   }
 
@@ -99,7 +117,7 @@ export async function ensureAvd(
     if (!cfg.installSdk) {
       throw new Error(
         `Required system image is missing: android-${cfg.apiLevel};${cfg.systemImageTag};${cfg.abi}\n` +
-        "Rerun with: bun run init -- --install-sdk",
+          "Rerun with: bun run init -- --install-sdk",
       );
     }
     const imagePackage = `system-images;android-${cfg.apiLevel};${cfg.systemImageTag};${cfg.abi}`;
@@ -107,11 +125,15 @@ export async function ensureAvd(
     // See src/sdk.ts installHeadlessSdk() for why --sdk_root=<path> must
     // never be passed on sdkmanager.bat's argv when <path> contains a
     // space — ANDROID_SDK_ROOT/ANDROID_HOME env vars carry it instead.
-    const result = await runLive(sdkmanagerPath(cfg.sdkRoot, platform), [
-      "--install", imagePackage,
-    ], { env: { ANDROID_SDK_ROOT: cfg.sdkRoot, ANDROID_HOME: cfg.sdkRoot } });
+    const result = await runLive(
+      sdkmanagerPath(cfg.sdkRoot, platform),
+      ["--install", imagePackage],
+      { env: { ANDROID_SDK_ROOT: cfg.sdkRoot, ANDROID_HOME: cfg.sdkRoot } },
+    );
     if (result !== 0 || !systemImageInstalled(cfg)) {
-      throw new Error(`Could not install required system image: ${imagePackage}`);
+      throw new Error(
+        `Could not install required system image: ${imagePackage}`,
+      );
     }
     log.good("Target system image installed.");
   }
@@ -123,10 +145,13 @@ export async function ensureAvd(
       // created before this GPU fix existed (or with GPU otherwise disabled)
       // would otherwise never get hw.gpu.enabled=yes just by being reused.
       applyGpuConfig(cfg.avdName);
+      clearAvdProxyConfig(cfg.avdName);
       lockEmulatorWindow(cfg, cfg.avdName, platform);
       return;
     }
-    log.warn(`--force-avd set — deleting existing AVD '${cfg.avdName}' and recreating.`);
+    log.warn(
+      `--force-avd set — deleting existing AVD '${cfg.avdName}' and recreating.`,
+    );
     deleteAvd(cfg.avdName, cfg.sdkRoot, platform);
   }
 
@@ -134,23 +159,31 @@ export async function ensureAvd(
   const deviceId = resolveDeviceProfile(avdmgr, cfg.deviceProfile);
 
   log.info(`Creating AVD: ${cfg.avdName}`);
-  log.info(`  system image: android-${cfg.apiLevel}  ${cfg.systemImageTag}/${cfg.abi}`);
+  log.info(
+    `  system image: android-${cfg.apiLevel}  ${cfg.systemImageTag}/${cfg.abi}`,
+  );
   log.info(`  device profile: ${deviceId}`);
 
   const pkg = `system-images;android-${cfg.apiLevel};${cfg.systemImageTag};${cfg.abi}`;
 
   const r = run(avdmgr, [
-    "create", "avd",
-    "--name",    cfg.avdName,
-    "--package", pkg,
-    "--device",  deviceId,
+    "create",
+    "avd",
+    "--name",
+    cfg.avdName,
+    "--package",
+    pkg,
+    "--device",
+    deviceId,
     "--force",
   ]);
 
   // avdmanager prompts "Do you wish to create a custom hardware profile?" — answer no.
   // If it was interactive, the run above captured it; the default (no custom profile) is fine.
   if (!r.ok && !r.stdout.includes("created")) {
-    throw new Error(`avdmanager failed:\n${r.stderr.trim() || r.stdout.trim()}`);
+    throw new Error(
+      `avdmanager failed:\n${r.stderr.trim() || r.stdout.trim()}`,
+    );
   }
 
   // Defensive: cfg.apiLevel is always a plain integer for the target today,
@@ -164,7 +197,11 @@ export async function ensureAvd(
   lockEmulatorWindow(cfg, cfg.avdName, platform);
 }
 
-function deleteAvd(name: string, sdkRoot: string, platform: PlatformInfo): void {
+function deleteAvd(
+  name: string,
+  sdkRoot: string,
+  platform: PlatformInfo,
+): void {
   const avdmgr = avdmanagerPath(sdkRoot, platform);
   run(avdmgr, ["delete", "avd", "--name", name]);
 }
@@ -175,7 +212,8 @@ function deleteAvd(name: string, sdkRoot: string, platform: PlatformInfo): void 
  * always assuming the default ~/.android/avd.
  */
 function avdHomeDir(avdName: string): string {
-  const avdBase = process.env.ANDROID_AVD_HOME || join(homedir(), ".android", "avd");
+  const avdBase =
+    process.env.ANDROID_AVD_HOME || join(homedir(), ".android", "avd");
   return join(avdBase, `${avdName}.avd`);
 }
 
@@ -188,7 +226,9 @@ function applyHardwareConfig(cfg: LabConfig): void {
   const configFile = join(avdHome, "config.ini");
 
   if (!existsSync(configFile)) {
-    log.warn(`Hardware config not found: ${configFile} (skipping custom RAM/disk)`);
+    log.warn(
+      `Hardware config not found: ${configFile} (skipping custom RAM/disk)`,
+    );
     return;
   }
 
@@ -203,13 +243,15 @@ function applyHardwareConfig(cfg: LabConfig): void {
     }
   }
 
-  setKey("hw.ramSize",         String(cfg.avdRamMb));
-  setKey("hw.cpu.ncore",       String(cfg.avdCores));
+  setKey("hw.ramSize", String(cfg.avdRamMb));
+  setKey("hw.cpu.ncore", String(cfg.avdCores));
   setKey("disk.dataPartition.size", `${cfg.avdDiskMb}M`);
-  setKey("sdcard.size",        `${cfg.avdSdCardMb}M`);
+  setKey("sdcard.size", `${cfg.avdSdCardMb}M`);
 
   writeFileSync(configFile, ini, "utf8");
-  log.good(`Hardware config written (${cfg.avdRamMb} MB RAM, ${cfg.avdCores} cores).`);
+  log.good(
+    `Hardware config written (${cfg.avdRamMb} MB RAM, ${cfg.avdCores} cores).`,
+  );
 
   // GPU must be enabled separately (see applyGpuConfig) — do it for the
   // target AVD here right after its other hardware config.
@@ -242,17 +284,21 @@ function applyHardwareConfig(cfg: LabConfig): void {
 export function applyGpuConfig(avdName: string): void {
   const configFile = join(avdHomeDir(avdName), "config.ini");
   if (!existsSync(configFile)) {
-    log.warn(`config.ini not found for ${avdName} — cannot apply GPU/keyboard config (${configFile}).`);
+    log.warn(
+      `config.ini not found for ${avdName} — cannot apply GPU/keyboard config (${configFile}).`,
+    );
     return;
   }
   let ini = readFileSync(configFile, "utf8");
   const setKey = (key: string, value: string) => {
     const re = new RegExp(`^${key}=.*$`, "m");
-    ini = re.test(ini) ? ini.replace(re, `${key}=${value}`) : ini + `\n${key}=${value}`;
+    ini = re.test(ini)
+      ? ini.replace(re, `${key}=${value}`)
+      : ini + `\n${key}=${value}`;
   };
   setKey("hw.gpu.enabled", "yes");
-  setKey("hw.gpu.mode",    "auto");
-  setKey("hw.keyboard",    "yes");
+  setKey("hw.gpu.mode", "auto");
+  setKey("hw.keyboard", "yes");
   writeFileSync(configFile, ini, "utf8");
   log.good(`GPU + host keyboard enabled for AVD: ${avdName}`);
 }
@@ -301,9 +347,14 @@ export function repairAvdIdentity(avdName: string, apiLevel: number): void {
   if (existsSync(iniPath)) {
     let pointerIni = readFileSync(iniPath, "utf8");
     if (/^target=android-0$/m.test(pointerIni)) {
-      pointerIni = pointerIni.replace(/^target=android-0$/m, `target=android-${apiLevel}`);
+      pointerIni = pointerIni.replace(
+        /^target=android-0$/m,
+        `target=android-${apiLevel}`,
+      );
       writeFileSync(iniPath, pointerIni, "utf8");
-      log.good(`Repaired unresolved AVD target (was android-0) -> android-${apiLevel}: ${avdName}`);
+      log.good(
+        `Repaired unresolved AVD target (was android-0) -> android-${apiLevel}: ${avdName}`,
+      );
     }
   }
 
@@ -313,7 +364,10 @@ export function repairAvdIdentity(avdName: string, apiLevel: number): void {
 
   const fixLiteral = (key: string, placeholder: string, value: string) => {
     const re = new RegExp(`^${key}=${placeholder}$`, "m");
-    if (re.test(ini)) { ini = ini.replace(re, `${key}=${value}`); repaired = true; }
+    if (re.test(ini)) {
+      ini = ini.replace(re, `${key}=${value}`);
+      repaired = true;
+    }
   };
   fixLiteral("avd\\.id", "<build>", avdName);
   fixLiteral("avd\\.name", "<build>", avdName);
@@ -323,10 +377,16 @@ export function repairAvdIdentity(avdName: string, apiLevel: number): void {
   // AVD doesn't set disk.dataPartition.path at all, letting the emulator
   // fall back to its own default.
   const tempLineRe = /^[^\n=]+=<temp>$\n?/m;
-  if (tempLineRe.test(ini)) { ini = ini.replace(tempLineRe, ""); repaired = true; }
+  if (tempLineRe.test(ini)) {
+    ini = ini.replace(tempLineRe, "");
+    repaired = true;
+  }
 
   const setKeyIfMissing = (key: string, value: string) => {
-    if (!new RegExp(`^${key}=`, "m").test(ini)) { ini += `\n${key}=${value}`; repaired = true; }
+    if (!new RegExp(`^${key}=`, "m").test(ini)) {
+      ini += `\n${key}=${value}`;
+      repaired = true;
+    }
   };
   setKeyIfMissing("AvdId", avdName);
   setKeyIfMissing("avd.ini.displayname", avdName);
@@ -338,7 +398,9 @@ export function repairAvdIdentity(avdName: string, apiLevel: number): void {
 
   if (repaired) {
     writeFileSync(configPath, ini, "utf8");
-    log.good(`Repaired unresolved avdmanager template placeholders in config.ini: ${avdName}`);
+    log.good(
+      `Repaired unresolved avdmanager template placeholders in config.ini: ${avdName}`,
+    );
   }
 }
 
@@ -367,15 +429,18 @@ function windowsWorkArea(): { width: number; height: number } | null {
   if (process.platform !== "win32") return null;
 
   const viaForms = run("powershell", [
-    "-NoProfile", "-Command",
+    "-NoProfile",
+    "-Command",
     "Add-Type -AssemblyName System.Windows.Forms; " +
-    "$a = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea; \"$($a.Width)x$($a.Height)\"",
+      '$a = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea; "$($a.Width)x$($a.Height)"',
   ]);
   let m = viaForms.stdout.trim().match(/^(\d+)x(\d+)$/);
-  if (viaForms.ok && m) return { width: parseInt(m[1], 10), height: parseInt(m[2], 10) };
+  if (viaForms.ok && m)
+    return { width: parseInt(m[1], 10), height: parseInt(m[2], 10) };
 
   const viaGdi = run("powershell", [
-    "-NoProfile", "-Command",
+    "-NoProfile",
+    "-Command",
     `Add-Type @"
 using System.Runtime.InteropServices;
 public class LabMetrics { [DllImport("user32.dll")] public static extern int GetSystemMetrics(int n); }
@@ -383,7 +448,8 @@ public class LabMetrics { [DllImport("user32.dll")] public static extern int Get
 "$([LabMetrics]::GetSystemMetrics(0))x$([LabMetrics]::GetSystemMetrics(1))"`,
   ]);
   m = viaGdi.stdout.trim().match(/^(\d+)x(\d+)$/);
-  if (viaGdi.ok && m) return { width: parseInt(m[1], 10), height: parseInt(m[2], 10) };
+  if (viaGdi.ok && m)
+    return { width: parseInt(m[1], 10), height: parseInt(m[2], 10) };
 
   return null;
 }
@@ -407,7 +473,11 @@ public class LabMetrics { [DllImport("user32.dll")] public static extern int Get
  * not a static human-picked constant. Pass an explicit
  * --window-scale=<n> (n > 0) to override with a literal scale instead.
  */
-export function lockEmulatorWindow(cfg: LabConfig, avdName: string, platform: PlatformInfo): void {
+export function lockEmulatorWindow(
+  cfg: LabConfig,
+  avdName: string,
+  platform: PlatformInfo,
+): void {
   if (!cfg.lockWindow) return;
 
   const avdHome = avdHomeDir(avdName);
@@ -420,17 +490,33 @@ export function lockEmulatorWindow(cfg: LabConfig, avdName: string, platform: Pl
   if (scale === null) {
     const configPath = join(avdHome, "config.ini");
     const workArea = windowsWorkArea();
-    const configIni = existsSync(configPath) ? readFileSync(configPath, "utf8") : "";
-    const lcdHeight = parseInt(configIni.match(/^hw\.lcd\.height\s*=\s*(\d+)/m)?.[1] ?? "", 10);
-    const lcdWidth = parseInt(configIni.match(/^hw\.lcd\.width\s*=\s*(\d+)/m)?.[1] ?? "", 10);
-    if (workArea && !isNaN(lcdHeight) && lcdHeight > 0 && !isNaN(lcdWidth) && lcdWidth > 0) {
+    const configIni = existsSync(configPath)
+      ? readFileSync(configPath, "utf8")
+      : "";
+    const lcdHeight = parseInt(
+      configIni.match(/^hw\.lcd\.height\s*=\s*(\d+)/m)?.[1] ?? "",
+      10,
+    );
+    const lcdWidth = parseInt(
+      configIni.match(/^hw\.lcd\.width\s*=\s*(\d+)/m)?.[1] ?? "",
+      10,
+    );
+    if (
+      workArea &&
+      !isNaN(lcdHeight) &&
+      lcdHeight > 0 &&
+      !isNaN(lcdWidth) &&
+      lcdWidth > 0
+    ) {
       const margin = 0.92;
       const byHeight = (workArea.height * margin) / lcdHeight;
       const byWidth = (workArea.width * margin) / lcdWidth;
       scale = Math.min(1.0, byHeight, byWidth);
       autoFit = true;
     } else {
-      log.warn(`Could not measure screen/device size for ${avdName} — leaving window.scale unset (emulator default) instead of guessing.`);
+      log.warn(
+        `Could not measure screen/device size for ${avdName} — leaving window.scale unset (emulator default) instead of guessing.`,
+      );
     }
   }
 
@@ -497,9 +583,10 @@ export function launchWindowsEmulator(
   mkdirSync(cacheDir, { recursive: true });
   const stdoutLog = join(cacheDir, `emulator-${avdName}.stdout.log`);
   const stderrLog = join(cacheDir, `emulator-${avdName}.stderr.log`);
-  const argStr = args.map(a => `'${a}'`).join(",");
+  const argStr = args.map((a) => `'${a}'`).join(",");
   const windowFlag = showWindow ? "-NoNewWindow" : "-WindowStyle Hidden";
-  const ps = `(Start-Process -FilePath '${emuPath}' -ArgumentList ${argStr} ` +
+  const ps =
+    `(Start-Process -FilePath '${emuPath}' -ArgumentList ${argStr} ` +
     `-RedirectStandardOutput '${stdoutLog}' -RedirectStandardError '${stderrLog}' ` +
     `${windowFlag} -PassThru).Id`;
   // `Start-Process -PassThru` normally returns almost instantly — it only
@@ -512,15 +599,19 @@ export function launchWindowsEmulator(
   // with zero output in the meantime, indistinguishable from the script
   // being frozen. Bound it so a genuine hang (not just a slow first-run
   // scan) fails with an actionable message instead of blocking forever.
-  log.info("Starting the emulator process (a brand-new machine's first launch can take noticeably longer here — antivirus scanning a never-seen executable is the usual reason, not a hang)…");
-  const r = run("powershell", ["-NoProfile", "-Command", ps], { timeoutMs: 120_000 });
+  log.info(
+    "Starting the emulator process (a brand-new machine's first launch can take noticeably longer here — antivirus scanning a never-seen executable is the usual reason, not a hang)…",
+  );
+  const r = run("powershell", ["-NoProfile", "-Command", ps], {
+    timeoutMs: 120_000,
+  });
   const pid = parseInt(r.stdout.trim(), 10);
   if (isNaN(pid)) {
     log.warn(
       `Could not read a PID back from the emulator launch (PowerShell output: "${r.stdout.trim()}", ` +
-      `stderr: "${r.stderr.trim()}"). If this was a timeout, antivirus/EDR software may be blocking or ` +
-      `heavily delaying emulator.exe/qemu-system-x86_64.exe — check its logs or add an exclusion for ` +
-      `the SDK's emulator/ directory, then retry.`,
+        `stderr: "${r.stderr.trim()}"). If this was a timeout, antivirus/EDR software may be blocking or ` +
+        `heavily delaying emulator.exe/qemu-system-x86_64.exe — check its logs or add an exclusion for ` +
+        `the SDK's emulator/ directory, then retry.`,
     );
   }
   return isNaN(pid) ? 0 : pid;
@@ -551,7 +642,8 @@ export async function startEmulator(
 ): Promise<number> {
   const emuPath = emulatorPath(cfg.sdkRoot, platform);
   const args = [
-    "-avd",         cfg.avdName,
+    "-avd",
+    cfg.avdName,
     "-no-boot-anim",
     "-no-audio",
     // Always cold-boot and never save/load a boot snapshot. A snapshot saved
@@ -562,7 +654,8 @@ export async function startEmulator(
     // Cold-booting every time is a bit slower but reliable and reproducible,
     // which is what a lab wants.
     "-no-snapshot",
-    "-gpu",         gpuModeOverride ?? cfg.gpuMode,
+    "-gpu",
+    gpuModeOverride ?? cfg.gpuMode,
     // NOTE: deliberately NOT passing -writable-system. It was confirmed to
     // trigger a broken/hung boot on this project's Android 13 image (boot
     // stalls right after WHPX init, never reaches graphics/boot-complete;
@@ -575,7 +668,13 @@ export async function startEmulator(
   log.info(`Launching emulator: ${cfg.avdName}`);
 
   if (platform.type === "windows") {
-    const pid = launchWindowsEmulator(emuPath, args, cfg.avdName, cfg.cacheDir, cfg.showWindow);
+    const pid = launchWindowsEmulator(
+      emuPath,
+      args,
+      cfg.avdName,
+      cfg.cacheDir,
+      cfg.showWindow,
+    );
     log.good(`Emulator started (Windows, PID=${pid || "?"}).`);
     return pid;
   }
@@ -585,7 +684,7 @@ export async function startEmulator(
   const proc = Bun.spawn([emuPath, ...args], {
     stdout: "ignore",
     stderr: "ignore",
-    stdin:  "ignore",
+    stdin: "ignore",
   });
   log.good(`Emulator started (PID=${proc.pid}).`);
   return proc.pid;
@@ -628,7 +727,10 @@ export function killEmulator(adbPath: string, serial: string): void {
  *   a real OS-level maximize works and is what's used to size its window
  *   instead of any custom scale math.
  */
-export function bringEmulatorWindowToFront(avdName: string, maximize = false): void {
+export function bringEmulatorWindowToFront(
+  avdName: string,
+  maximize = false,
+): void {
   if (process.platform !== "win32") return;
   const showCmd = maximize ? 3 : 9; // SW_SHOWMAXIMIZED : SW_RESTORE
   // Target the window BY AVD NAME (its title is "Android Emulator -
@@ -670,6 +772,32 @@ for ($i=0; $i -lt 8 -and -not $raised; $i++) {
 }
 if ($raised) { Write-Output "raised" } else { Write-Output "no-window" }`;
   const r = run("powershell", ["-NoProfile", "-Command", ps]);
-  if (r.stdout.includes("raised")) log.good(`Emulator window brought to front: ${avdName}`);
+  if (r.stdout.includes("raised"))
+    log.good(`Emulator window brought to front: ${avdName}`);
   else log.warn(`Could not find the emulator window to raise (${avdName}).`);
+}
+
+/**
+ * Remove any proxy-related keys from the AVD's config.ini.
+ *
+ * Android Studio's Extended Controls → Proxy writes http_proxy-style
+ * settings into the AVD config; the "No proxy" radio doesn't always
+ * delete them. If a stale value points at a proxy that isn't running,
+ * every guest request blackholes. The right place to configure the
+ * proxy is Android's own `settings put global http_proxy` (handled by
+ * src/proxy.ts at runtime), not the AVD's static config.
+ *
+ * No-op if no such key exists.
+ */
+export function clearAvdProxyConfig(avdName: string): void {
+  const configFile = join(avdHomeDir(avdName), "config.ini");
+  if (!existsSync(configFile)) return;
+
+  const before = readFileSync(configFile, "utf8");
+  // Strip any line whose key contains "proxy" (case-insensitive).
+  const after = before.replace(/^[^\n=]*proxy[^\n=]*=.*$\n?/gim, "");
+  if (after !== before) {
+    writeFileSync(configFile, after, "utf8");
+    log.good(`Cleared stale proxy config from AVD: ${avdName}`);
+  }
 }
