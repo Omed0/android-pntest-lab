@@ -676,9 +676,10 @@ async function main(): Promise<void> {
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (!/MISSING_SPLIT|INSTALL_FAILED/i.test(message)) throw error;
-        log.warn(
-          "Local APK is incomplete; trying the Play Store source instead.",
-        );
+        const abis = /NO_MATCHING_ABIS/i.test(message)
+          ? " (APK architecture doesn't match the emulator — use the Play Store version or a universal APK)"
+          : " (split APK set is incomplete — make sure all split_config.*.apk files are present alongside base.apk)";
+        log.warn(`Local APK install failed${abis}. Checking if package is already installed…`);
       }
       packageReady = packageInstalled(adb, runOpts.package);
     }
