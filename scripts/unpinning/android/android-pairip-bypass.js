@@ -3,10 +3,32 @@
 // PairIP's LicenseActivity does a Play Store license check at startup and calls
 // System.exit(0) when the app was sideloaded or the emulator account is not
 // licensed. An async background thread re-checks the license and also calls
-// System.exit(0) when it fails.
-// Fix: intercept LicenseActivity.onCreate() calling Activity.onCreate() to
-// satisfy Android's lifecycle requirement, then deliver RESULT_OK; also block
-// System.exit/Runtime.exit(0) from the background thread.
+// System.exit(0) when it fails. libpairip.so may also call _exit() directly
+// (bypasses all Java-layer hooks) or android.os.Process.killProcess(myPid).
+// Fix: intercept all three kill paths.
+
+// Block _exit() at the native layer before Java.perform — covers calls from
+// libpairip.so's C code that bypass Java's System.exit entirely.
+try {
+  var nativeExitAddr =
+    Module.findExportByName("libc.so", "_exit") ||
+    Module.findExportByName("libc.so", "exit");
+  if (nativeExitAddr) {
+    Interceptor.replace(
+      nativeExitAddr,
+      new NativeCallback(
+        function (code) {
+          console.log(
+            "== [PairIP bypass] native _exit(" + code + ") blocked ==",
+          );
+        },
+        "void",
+        ["int"],
+      ),
+    );
+  }
+} catch (_) {}
+
 Java.perform(function () {
   var hasPairIP = false;
   try {
@@ -45,5 +67,14 @@ Java.perform(function () {
   var Runtime = Java.use("java.lang.Runtime");
   Runtime.exit.overload("int").implementation = function (code) {
     console.log("== [PairIP bypass] Runtime.exit(" + code + ") blocked ==");
+  };
+
+  // Block Process.killProcess — PairIP may send SIGKILL to its own pid via
+  // this API instead of calling System.exit().
+  var AndroidProcess = Java.use("android.os.Process");
+  AndroidProcess.killProcess.overload("int").implementation = function (pid) {
+    console.log(
+      "== [PairIP bypass] Process.killProcess(" + pid + ") blocked ==",
+    );
   };
 });

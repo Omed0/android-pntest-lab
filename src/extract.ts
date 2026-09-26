@@ -159,20 +159,10 @@ function runJadx(jadx: string, args: string[]) {
     return run(jadx, args);
   }
 
-  const quoteCmdArg = (value: string): string =>
-    `"${value.replace(/"/g, '""')}"`;
-
-  // `call` is required because JADX is a .bat file.
-  //
-  // Example generated command:
-  //
-  // call "D:\redteam\mobile app\android-pentest-lab\tools\jadx\bin\jadx.bat" "-d" "D:\redteam\mobile app\..."
-  //
-  const command = ["call", quoteCmdArg(jadx), ...args.map(quoteCmdArg)].join(
-    " ",
-  );
-
-  const proc = Bun.spawnSync(["cmd.exe", "/d", "/c", command], {
+  // Pass jadx and each arg as separate elements so Bun's CreateProcess quoting
+  // handles paths with spaces correctly. `call` is only needed inside a .bat
+  // calling another .bat; cmd.exe /c can invoke a .bat directly.
+  const proc = Bun.spawnSync(["cmd.exe", "/d", "/c", jadx, ...args], {
     stdout: "pipe",
     stderr: "pipe",
   });
