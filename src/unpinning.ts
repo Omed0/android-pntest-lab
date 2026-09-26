@@ -621,6 +621,7 @@ export async function buildUnpinningScriptChain(
     join(scriptsDir, "android", "android-certificate-unpinning.js"),
     join(scriptsDir, "android", "android-certificate-unpinning-fallback.js"),
     join(scriptsDir, "android", "android-disable-root-detection.js"),
+    join(scriptsDir, "android", "android-pairip-bypass.js"),
     join(
       scriptsDir,
       "android",
