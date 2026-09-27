@@ -1,140 +1,268 @@
 "use strict";
 // PairIP DRM bypass
-// PairIP's LicenseActivity does a Play Store license check at startup and calls
-// System.exit(0) when the app was sideloaded or the emulator account is not
-// licensed. An async background thread re-checks the license and also calls
-// System.exit(0) when it fails. libpairip.so may also call _exit() directly
-// (bypasses all Java-layer hooks) or android.os.Process.killProcess(myPid).
-// Fix: intercept all three kill paths.
+//
+// Kill paths covered:
+//   1. LicenseActivity.onCreate   → immediate RESULT_OK + finish()
+//   2. System.exit / Runtime.exit / Runtime.halt   (Java-layer kills)
+//   3. Process.killProcess / Process.sendSignal    (Java SIGKILL paths)
+//   4. Guardian service blocking  (prevents the watcher process from spawning)
+//   5. LicenseCheckerCallback.dontAllow → allow    (makes check appear to pass)
+//   6. Native _exit / exit        (libpairip.so C-level kill, ret-stub hook)
 
-// Block _exit() at the native layer before Java.perform — covers calls from
-// libpairip.so's C code that bypass Java's System.exit entirely.
-// Uses a raw ret-instruction stub instead of NativeCallback (which is broken
-// in Frida 17.x at spawn time) — Interceptor.replace accepts any NativePointer.
-try {
-  var nativeExitAddr =
-    Module.findExportByName("libc.so", "_exit") ||
-    Module.findExportByName("libc.so", "exit") ||
-    Module.findExportByName(null, "_exit") ||
-    Module.findExportByName(null, "exit");
-  if (nativeExitAddr) {
-    // Write a minimal no-op stub: just a ret instruction so _exit returns to
-    // its caller instead of terminating the process.
-    var retOpcode =
-      Process.arch === "arm64"
-        ? [0xc0, 0x03, 0x5f, 0xd6] // RET
-        : Process.arch === "arm"
-          ? [0x1e, 0xff, 0x2f, 0xe1] // BX LR
-          : [0xc3]; // x86 / x86_64 RET
-    var stub = Memory.alloc(Process.pageSize);
-    Memory.protect(stub, Process.pageSize, "rwx");
-    stub.writeByteArray(retOpcode);
-    Interceptor.replace(nativeExitAddr, stub);
-    console.log(
-      "== [PairIP bypass] native exit hooked (ret stub) at " + nativeExitAddr + " ==",
-    );
+// ── 6. Native _exit hook ─────────────────────────────────────────────────────
+// Per-call isolation so a TypeError on one attempt does not mask the others.
+(function () {
+  var addr = null;
+  var attempts = [
+    ["libc.so", "_exit"],
+    ["libc.so", "exit"],
+    [null, "_exit"],
+    [null, "exit"],
+  ];
+  for (var i = 0; i < attempts.length && !addr; i++) {
+    try {
+      addr = Module.findExportByName(attempts[i][0], attempts[i][1]);
+      if (addr) {
+        console.log(
+          "== [PairIP bypass] native " +
+            attempts[i][1] +
+            " found in " +
+            (attempts[i][0] || "all modules") +
+            " at " +
+            addr +
+            " ==",
+        );
+      }
+    } catch (e) {
+      console.log(
+        "== [PairIP bypass] findExportByName(" +
+          attempts[i][0] +
+          ", " +
+          attempts[i][1] +
+          ") threw: " +
+          e +
+          " ==",
+      );
+    }
+  }
+  if (addr) {
+    try {
+      // Write a minimal no-op stub (just a ret) so _exit returns instead of
+      // terminating the process. Interceptor.replace accepts any NativePointer.
+      var retOpcode =
+        Process.arch === "arm64"
+          ? [0xc0, 0x03, 0x5f, 0xd6] // RET
+          : Process.arch === "arm"
+            ? [0x1e, 0xff, 0x2f, 0xe1] // BX LR
+            : [0xc3]; // x86 / x86_64 RET
+      var stub = Memory.alloc(Process.pageSize);
+      Memory.protect(stub, Process.pageSize, "rwx");
+      stub.writeByteArray(retOpcode);
+      Interceptor.replace(addr, stub);
+      console.log("== [PairIP bypass] native exit hooked (ret stub) ==");
+    } catch (e) {
+      console.log("== [PairIP bypass] native exit replace failed: " + e + " ==");
+    }
   } else {
     console.log(
-      "== [PairIP bypass] WARNING: native exit symbol not found — native kill path may be unblocked ==",
+      "== [PairIP bypass] native exit not found — C-level kill path unblocked ==",
     );
   }
-} catch (e) {
-  console.log("== [PairIP bypass] native exit hook error: " + e + " ==");
-}
+})();
 
+// ── Java hooks ───────────────────────────────────────────────────────────────
 Java.perform(function () {
   var hasPairIP = false;
   try {
     Java.use("com.pairip.licensecheck.LicenseActivity");
     hasPairIP = true;
   } catch (_) {}
-
   if (!hasPairIP) return;
 
-  console.log("== PairIP detected — bypassing LicenseActivity ==");
+  console.log("== PairIP detected — installing bypass ==");
 
+  // ── 1. LicenseActivity.onCreate ──────────────────────────────────────────
   var LicenseActivity = Java.use("com.pairip.licensecheck.LicenseActivity");
-  // Call android.app.Activity.onCreate() directly (base-class only) to satisfy
-  // Android's super.onCreate() requirement without running PairIP's license-check
-  // logic, then immediately deliver RESULT_OK and finish.
   var ActivityBase = Java.use("android.app.Activity");
-
   LicenseActivity.onCreate.overload("android.os.Bundle").implementation =
     function (bundle) {
       ActivityBase.onCreate.overload("android.os.Bundle").call(this, bundle);
       console.log(
         "== [PairIP bypass] LicenseActivity.onCreate intercepted — returning RESULT_OK ==",
       );
-      this.setResult(-1 /* Activity.RESULT_OK */);
+      this.setResult(-1 /* RESULT_OK */);
       this.finish();
     };
 
-  // PairIP also fires an async background check that calls System.exit(0) on
-  // failure. Real app crashes go through uncaught exception handlers, not
-  // System.exit — so blocking all Java-layer exits is safe in a pentest context.
-  var System = Java.use("java.lang.System");
-  System.exit.overload("int").implementation = function (code) {
+  // ── 2. Java-layer exit kills ──────────────────────────────────────────────
+  Java.use("java.lang.System")
+    .exit.overload("int")
+    .implementation = function (code) {
     console.log("== [PairIP bypass] System.exit(" + code + ") blocked ==");
   };
-
-  var Runtime = Java.use("java.lang.Runtime");
-  Runtime.exit.overload("int").implementation = function (code) {
+  Java.use("java.lang.Runtime")
+    .exit.overload("int")
+    .implementation = function (code) {
     console.log("== [PairIP bypass] Runtime.exit(" + code + ") blocked ==");
   };
-
-  // Block Process.killProcess and Process.sendSignal — PairIP may send SIGKILL
-  // via either API instead of calling System.exit().
-  var AndroidProcess = Java.use("android.os.Process");
-  AndroidProcess.killProcess.overload("int").implementation = function (pid) {
-    console.log(
-      "== [PairIP bypass] Process.killProcess(" + pid + ") blocked ==",
-    );
-  };
   try {
-    AndroidProcess.sendSignal.overload("int", "int").implementation = function (
-      pid,
-      signal,
-    ) {
-      console.log(
-        "== [PairIP bypass] Process.sendSignal(" + pid + ", " + signal + ") blocked ==",
-      );
-    };
-  } catch (_) {}
-
-  // Block Runtime.halt() — bypasses shutdown hooks, kills JVM directly.
-  var Runtime = Java.use("java.lang.Runtime");
-  try {
-    Runtime.halt.overload("int").implementation = function (code) {
+    Java.use("java.lang.Runtime")
+      .halt.overload("int")
+      .implementation = function (code) {
       console.log("== [PairIP bypass] Runtime.halt(" + code + ") blocked ==");
     };
   } catch (_) {}
 
-  // Diagnostic: log which Activity classes call finish() so we can see
-  // if a non-LicenseActivity is driving the close.
-  var Activity = Java.use("android.app.Activity");
-  var origFinish = Activity.finish.overload();
-  origFinish.implementation = function () {
-    var cls = this.getClass().getName();
-    if (cls.indexOf("pairip") !== -1 || cls.indexOf("LicenseActivity") !== -1) {
-      console.log("== [PairIP bypass] Activity.finish() called by: " + cls + " ==");
-    }
-    origFinish.call(this);
+  // ── 3. Process signal kills ───────────────────────────────────────────────
+  var Proc = Java.use("android.os.Process");
+  Proc.killProcess.overload("int").implementation = function (pid) {
+    console.log("== [PairIP bypass] Process.killProcess(" + pid + ") blocked ==");
   };
+  try {
+    Proc.sendSignal.overload("int", "int").implementation = function (pid, sig) {
+      console.log(
+        "== [PairIP bypass] Process.sendSignal(" + pid + ", " + sig + ") blocked ==",
+      );
+    };
+  } catch (_) {}
 
-  // Diagnostic: catch uncaught exceptions before they crash the process —
-  // lets us see if PairIP throws RuntimeException instead of calling exit().
-  var Thread = Java.use("java.lang.Thread");
-  Thread.dispatchUncaughtException.implementation = function (exc) {
-    var msg = exc.toString();
-    if (
-      msg.indexOf("pairip") !== -1 ||
-      msg.indexOf("license") !== -1 ||
-      msg.indexOf("LicenseActivity") !== -1
-    ) {
-      console.log("== [PairIP bypass] uncaught exception (suppressed): " + msg + " ==");
-      return;
+  // ── 4. Guardian service blocking ─────────────────────────────────────────
+  // PairIP spawns a watcher (guardian) process/service that sends SIGKILL to
+  // the main process when the license check fails. Block it before it starts.
+  var ContextWrapper = Java.use("android.content.ContextWrapper");
+
+  function isPairIPIntent(intent) {
+    try {
+      var comp = intent.getComponent();
+      var compCls = comp ? comp.getClassName() : "";
+      var pkg =
+        comp ? comp.getPackageName() : (intent.getPackage() || "");
+      var action = intent.getAction() || "";
+      return (
+        compCls.indexOf("pairip") !== -1 ||
+        compCls.indexOf("LicenseService") !== -1 ||
+        compCls.indexOf("guardian") !== -1 ||
+        pkg.indexOf("pairip") !== -1 ||
+        action.indexOf("pairip") !== -1
+      );
+    } catch (_) {
+      return false;
     }
-    console.log("== [DEBUG] uncaught exception (not PairIP, allowing crash): " + msg + " ==");
-    this.dispatchUncaughtException(exc);
-  };
+  }
+
+  try {
+    var origStart = ContextWrapper.startService.overload(
+      "android.content.Intent",
+    );
+    origStart.implementation = function (intent) {
+      if (isPairIPIntent(intent)) {
+        console.log(
+          "== [PairIP bypass] guardian startService blocked: " + intent + " ==",
+        );
+        return null;
+      }
+      return origStart.call(this, intent);
+    };
+  } catch (_) {}
+
+  try {
+    var origBind = ContextWrapper.bindService.overload(
+      "android.content.Intent",
+      "android.content.ServiceConnection",
+      "int",
+    );
+    origBind.implementation = function (intent, conn, flags) {
+      if (isPairIPIntent(intent)) {
+        console.log(
+          "== [PairIP bypass] guardian bindService blocked: " + intent + " ==",
+        );
+        return false;
+      }
+      return origBind.call(this, intent, conn, flags);
+    };
+  } catch (_) {}
+
+  // ── 5. LicenseCheckerCallback.dontAllow → allow ───────────────────────────
+  // PairIP's internal LicenseCheckerCallback implementation calls dontAllow()
+  // when Google Play licensing fails. Redirect it to allow() so the check
+  // appears to pass and the guardian process never activates.
+
+  function hookDontAllow(className) {
+    try {
+      var cls = Java.use(className);
+      if (!cls.dontAllow) return;
+      cls.dontAllow.overloads.forEach(function (ov) {
+        ov.implementation = function (reason) {
+          console.log(
+            "== [PairIP bypass] " +
+              className +
+              ".dontAllow(" +
+              reason +
+              ") → redirecting to allow ==",
+          );
+          try {
+            this.allow(0);
+          } catch (_) {}
+        };
+      });
+      console.log(
+        "== [PairIP bypass] hooked dontAllow on " + className + " ==",
+      );
+    } catch (_) {}
+  }
+
+  // Known candidates; dynamic scan fills in the rest after classes load.
+  hookDontAllow("com.pairip.licensecheck.LicenseCheckerCallback");
+  hookDontAllow("com.pairip.licensecheck.DefaultLicenseCheckerCallback");
+  hookDontAllow("com.pairip.licensecheck.PairIPLicenseCheckerCallback");
+
+  // After 1 s, enumerate loaded classes to find any runtime-loaded pairip class
+  // and hook dontAllow on it. Log all pairip classes for visibility.
+  setTimeout(function () {
+    Java.perform(function () {
+      try {
+        Java.enumerateLoadedClassesSync().forEach(function (name) {
+          if (name.indexOf("pairip") !== -1) {
+            console.log("== [PairIP bypass] class loaded: " + name + " ==");
+            hookDontAllow(name);
+          }
+        });
+      } catch (_) {}
+    });
+  }, 1000);
+
+  // ── Diagnostics ───────────────────────────────────────────────────────────
+  // Log all Activity.finish() calls from pairip classes.
+  try {
+    var Activity = Java.use("android.app.Activity");
+    var origFinish = Activity.finish.overload();
+    origFinish.implementation = function () {
+      var cls = this.getClass().getName();
+      if (cls.indexOf("pairip") !== -1) {
+        console.log(
+          "== [PairIP bypass] Activity.finish() from: " + cls + " ==",
+        );
+      }
+      origFinish.call(this);
+    };
+  } catch (_) {}
+
+  // Log uncaught exceptions — if PairIP crashes the app via RuntimeException,
+  // suppress the PairIP one and let real crashes through.
+  try {
+    var Thread = Java.use("java.lang.Thread");
+    Thread.dispatchUncaughtException.implementation = function (exc) {
+      var msg = exc.toString();
+      if (msg.indexOf("pairip") !== -1 || msg.indexOf("LicenseActivity") !== -1) {
+        console.log(
+          "== [PairIP bypass] uncaught PairIP exception suppressed: " + msg + " ==",
+        );
+        return;
+      }
+      console.log("== [DEBUG] uncaught exception: " + msg + " ==");
+      this.dispatchUncaughtException(exc);
+    };
+  } catch (_) {}
+
+  console.log("== [PairIP bypass] all hooks installed ==");
 });
