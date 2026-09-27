@@ -9,8 +9,8 @@
 
 // Block _exit() at the native layer before Java.perform — covers calls from
 // libpairip.so's C code that bypass Java's System.exit entirely.
-// Search libc.so first, then all modules as fallback (the symbol may live in a
-// differently-named library on this Android build).
+// Uses a raw ret-instruction stub instead of NativeCallback (which is broken
+// in Frida 17.x at spawn time) — Interceptor.replace accepts any NativePointer.
 try {
   var nativeExitAddr =
     Module.findExportByName("libc.so", "_exit") ||
@@ -18,20 +18,20 @@ try {
     Module.findExportByName(null, "_exit") ||
     Module.findExportByName(null, "exit");
   if (nativeExitAddr) {
+    // Write a minimal no-op stub: just a ret instruction so _exit returns to
+    // its caller instead of terminating the process.
+    var retOpcode =
+      Process.arch === "arm64"
+        ? [0xc0, 0x03, 0x5f, 0xd6] // RET
+        : Process.arch === "arm"
+          ? [0x1e, 0xff, 0x2f, 0xe1] // BX LR
+          : [0xc3]; // x86 / x86_64 RET
+    var stub = Memory.alloc(Process.pageSize);
+    Memory.protect(stub, Process.pageSize, "rwx");
+    stub.writeByteArray(retOpcode);
+    Interceptor.replace(nativeExitAddr, stub);
     console.log(
-      "== [PairIP bypass] native exit found at " + nativeExitAddr + " — hook installed ==",
-    );
-    Interceptor.replace(
-      nativeExitAddr,
-      new NativeCallback(
-        function (code) {
-          console.log(
-            "== [PairIP bypass] native _exit(" + code + ") blocked ==",
-          );
-        },
-        "void",
-        ["int"],
-      ),
+      "== [PairIP bypass] native exit hooked (ret stub) at " + nativeExitAddr + " ==",
     );
   } else {
     console.log(
@@ -100,4 +100,41 @@ Java.perform(function () {
       );
     };
   } catch (_) {}
+
+  // Block Runtime.halt() — bypasses shutdown hooks, kills JVM directly.
+  var Runtime = Java.use("java.lang.Runtime");
+  try {
+    Runtime.halt.overload("int").implementation = function (code) {
+      console.log("== [PairIP bypass] Runtime.halt(" + code + ") blocked ==");
+    };
+  } catch (_) {}
+
+  // Diagnostic: log which Activity classes call finish() so we can see
+  // if a non-LicenseActivity is driving the close.
+  var Activity = Java.use("android.app.Activity");
+  var origFinish = Activity.finish.overload();
+  origFinish.implementation = function () {
+    var cls = this.getClass().getName();
+    if (cls.indexOf("pairip") !== -1 || cls.indexOf("LicenseActivity") !== -1) {
+      console.log("== [PairIP bypass] Activity.finish() called by: " + cls + " ==");
+    }
+    origFinish.call(this);
+  };
+
+  // Diagnostic: catch uncaught exceptions before they crash the process —
+  // lets us see if PairIP throws RuntimeException instead of calling exit().
+  var Thread = Java.use("java.lang.Thread");
+  Thread.dispatchUncaughtException.implementation = function (exc) {
+    var msg = exc.toString();
+    if (
+      msg.indexOf("pairip") !== -1 ||
+      msg.indexOf("license") !== -1 ||
+      msg.indexOf("LicenseActivity") !== -1
+    ) {
+      console.log("== [PairIP bypass] uncaught exception (suppressed): " + msg + " ==");
+      return;
+    }
+    console.log("== [DEBUG] uncaught exception (not PairIP, allowing crash): " + msg + " ==");
+    this.dispatchUncaughtException(exc);
+  };
 });
