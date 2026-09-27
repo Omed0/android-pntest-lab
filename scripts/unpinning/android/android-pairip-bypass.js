@@ -9,46 +9,23 @@
 //   5. LicenseCheckerCallback.dontAllow → allow    (makes check appear to pass)
 //   6. Native _exit / exit        (libpairip.so C-level kill, ret-stub hook)
 
-// ── 6. Native _exit hook ─────────────────────────────────────────────────────
-// Per-call isolation so a TypeError on one attempt does not mask the others.
+// ── Native kill hooks ────────────────────────────────────────────────────────
+// Module.findExportByName() is undefined in Frida 17.x (moved to the module
+// instance). Use Process.findModuleByName(name).findExportByName(symbol).
+// Hook both _exit/exit (JVM termination) and kill (SIGKILL sent from C code).
 (function () {
-  var addr = null;
-  var attempts = [
-    ["libc.so", "_exit"],
-    ["libc.so", "exit"],
-    [null, "_exit"],
-    [null, "exit"],
-  ];
-  for (var i = 0; i < attempts.length && !addr; i++) {
+  function findExport(modName, symbol) {
     try {
-      addr = Module.findExportByName(attempts[i][0], attempts[i][1]);
-      if (addr) {
-        console.log(
-          "== [PairIP bypass] native " +
-            attempts[i][1] +
-            " found in " +
-            (attempts[i][0] || "all modules") +
-            " at " +
-            addr +
-            " ==",
-        );
-      }
-    } catch (e) {
-      console.log(
-        "== [PairIP bypass] findExportByName(" +
-          attempts[i][0] +
-          ", " +
-          attempts[i][1] +
-          ") threw: " +
-          e +
-          " ==",
-      );
+      var mod = Process.findModuleByName(modName);
+      return mod ? mod.findExportByName(symbol) : null;
+    } catch (_) {
+      return null;
     }
   }
-  if (addr) {
+
+  function hookWithRetStub(addr, label) {
+    if (!addr) return false;
     try {
-      // Write a minimal no-op stub (just a ret) so _exit returns instead of
-      // terminating the process. Interceptor.replace accepts any NativePointer.
       var retOpcode =
         Process.arch === "arm64"
           ? [0xc0, 0x03, 0x5f, 0xd6] // RET
@@ -59,14 +36,43 @@
       Memory.protect(stub, Process.pageSize, "rwx");
       stub.writeByteArray(retOpcode);
       Interceptor.replace(addr, stub);
-      console.log("== [PairIP bypass] native exit hooked (ret stub) ==");
+      console.log("== [PairIP bypass] hooked " + label + " at " + addr + " ==");
+      return true;
     } catch (e) {
-      console.log("== [PairIP bypass] native exit replace failed: " + e + " ==");
+      console.log("== [PairIP bypass] hook " + label + " failed: " + e + " ==");
+      return false;
     }
-  } else {
-    console.log(
-      "== [PairIP bypass] native exit not found — C-level kill path unblocked ==",
-    );
+  }
+
+  // _exit / exit — JVM termination
+  hookWithRetStub(
+    findExport("libc.so", "_exit") || findExport("libc.so", "exit"),
+    "native _exit",
+  );
+
+  // kill(pid, sig) — libpairip.so sends SIGKILL to self via this libc function
+  var killAddr = findExport("libc.so", "kill");
+  if (killAddr) {
+    try {
+      Interceptor.attach(killAddr, {
+        onEnter: function (args) {
+          var sig = args[1].toInt32();
+          if (sig === 9 /* SIGKILL */ || sig === 19 /* SIGSTOP */) {
+            console.log(
+              "== [PairIP bypass] libc.kill(pid=" +
+                args[0].toInt32() +
+                ", sig=" +
+                sig +
+                ") blocked ==",
+            );
+            args[1] = ptr(0); // change signal to 0 (harmless existence check)
+          }
+        },
+      });
+      console.log("== [PairIP bypass] hooked libc.kill ==");
+    } catch (e) {
+      console.log("== [PairIP bypass] hook libc.kill failed: " + e + " ==");
+    }
   }
 })();
 
@@ -215,6 +221,93 @@ Java.perform(function () {
   hookDontAllow("com.pairip.licensecheck.LicenseCheckerCallback");
   hookDontAllow("com.pairip.licensecheck.DefaultLicenseCheckerCallback");
   hookDontAllow("com.pairip.licensecheck.PairIPLicenseCheckerCallback");
+
+  // ── LicenseClient direct hooks ──────────────────────────────────────────
+  // The actual license state machine. Hook it to:
+  // (a) log all method names so we know what's available
+  // (b) block DelayedTaskExecutor so background re-checks never run
+  // (c) intercept LicenseCheckException creation
+
+  try {
+    var LicenseClient = Java.use("com.pairip.licensecheck.LicenseClient");
+
+    // Log method names for discovery
+    var lcMethods = LicenseClient.class.getDeclaredMethods();
+    var lcNames = [];
+    for (var mi = 0; mi < lcMethods.length; mi++) {
+      lcNames.push(lcMethods[mi].getName());
+    }
+    console.log("== [LicenseClient methods] " + lcNames.join(", ") + " ==");
+
+    // Hook every method whose name suggests a failure / deny / kill path.
+    // If we get the name right the method becomes a no-op (returns undefined/void).
+    var killWords = ["deny", "fail", "exit", "kill", "stop", "block", "revoke",
+                     "invalid", "illegal", "forbidden", "dontAllow", "notLicensed",
+                     "unlicensed", "reject", "terminate", "abort"];
+    lcNames.forEach(function (name) {
+      var lower = name.toLowerCase();
+      var isKillCandidate = killWords.some(function (w) {
+        return lower.indexOf(w) !== -1;
+      });
+      if (!isKillCandidate) return;
+      try {
+        LicenseClient[name].overloads.forEach(function (ov) {
+          ov.implementation = function () {
+            console.log(
+              "== [PairIP bypass] LicenseClient." + name + " blocked ==",
+            );
+          };
+        });
+      } catch (_) {}
+    });
+  } catch (_) {}
+
+  // Block LicenseCheckException from propagating — PairIP may throw this
+  // instead of calling exit() to crash the app.
+  try {
+    var LicenseCheckException = Java.use(
+      "com.pairip.licensecheck.LicenseCheckException",
+    );
+    LicenseCheckException.$init.overloads.forEach(function (ov) {
+      var origInit = ov.implementation;
+      ov.implementation = function () {
+        console.log(
+          "== [PairIP bypass] LicenseCheckException created — will suppress ==",
+        );
+        ov.call.apply(ov, [this].concat(Array.prototype.slice.call(arguments)));
+      };
+    });
+  } catch (_) {}
+
+  // Block DelayedTaskExecutorImpl — prevents background license re-checks
+  // from ever scheduling a task that could trigger the kill.
+  try {
+    var DelayedExec = Java.use(
+      "com.pairip.licensecheck.LicenseClient$DelayedTaskExecutorImpl",
+    );
+    var delayedMethods = DelayedExec.class.getDeclaredMethods();
+    console.log(
+      "== [DelayedTaskExecutorImpl methods] " +
+        Array.from({length: delayedMethods.length}, function(_, i) {
+          return delayedMethods[i].getName();
+        }).join(", ") +
+        " ==",
+    );
+    // Block all scheduling methods
+    for (var di = 0; di < delayedMethods.length; di++) {
+      (function (methodName) {
+        try {
+          DelayedExec[methodName].overloads.forEach(function (ov) {
+            ov.implementation = function () {
+              console.log(
+                "== [PairIP bypass] DelayedTaskExecutorImpl." + methodName + " blocked ==",
+              );
+            };
+          });
+        } catch (_) {}
+      })(delayedMethods[di].getName());
+    }
+  } catch (_) {}
 
   // After 1 s, enumerate loaded classes to find any runtime-loaded pairip class
   // and hook dontAllow on it. Log all pairip classes for visibility.
