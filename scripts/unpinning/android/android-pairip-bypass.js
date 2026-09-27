@@ -9,11 +9,18 @@
 
 // Block _exit() at the native layer before Java.perform — covers calls from
 // libpairip.so's C code that bypass Java's System.exit entirely.
+// Search libc.so first, then all modules as fallback (the symbol may live in a
+// differently-named library on this Android build).
 try {
   var nativeExitAddr =
     Module.findExportByName("libc.so", "_exit") ||
-    Module.findExportByName("libc.so", "exit");
+    Module.findExportByName("libc.so", "exit") ||
+    Module.findExportByName(null, "_exit") ||
+    Module.findExportByName(null, "exit");
   if (nativeExitAddr) {
+    console.log(
+      "== [PairIP bypass] native exit found at " + nativeExitAddr + " — hook installed ==",
+    );
     Interceptor.replace(
       nativeExitAddr,
       new NativeCallback(
@@ -26,8 +33,14 @@ try {
         ["int"],
       ),
     );
+  } else {
+    console.log(
+      "== [PairIP bypass] WARNING: native exit symbol not found — native kill path may be unblocked ==",
+    );
   }
-} catch (_) {}
+} catch (e) {
+  console.log("== [PairIP bypass] native exit hook error: " + e + " ==");
+}
 
 Java.perform(function () {
   var hasPairIP = false;
@@ -69,12 +82,22 @@ Java.perform(function () {
     console.log("== [PairIP bypass] Runtime.exit(" + code + ") blocked ==");
   };
 
-  // Block Process.killProcess — PairIP may send SIGKILL to its own pid via
-  // this API instead of calling System.exit().
+  // Block Process.killProcess and Process.sendSignal — PairIP may send SIGKILL
+  // via either API instead of calling System.exit().
   var AndroidProcess = Java.use("android.os.Process");
   AndroidProcess.killProcess.overload("int").implementation = function (pid) {
     console.log(
       "== [PairIP bypass] Process.killProcess(" + pid + ") blocked ==",
     );
   };
+  try {
+    AndroidProcess.sendSignal.overload("int", "int").implementation = function (
+      pid,
+      signal,
+    ) {
+      console.log(
+        "== [PairIP bypass] Process.sendSignal(" + pid + ", " + signal + ") blocked ==",
+      );
+    };
+  } catch (_) {}
 });
