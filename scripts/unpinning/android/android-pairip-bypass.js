@@ -239,17 +239,20 @@ Java.perform(function () {
     }
     console.log("== [LicenseClient methods] " + lcNames.join(", ") + " ==");
 
-    // Hook every method whose name suggests a failure / deny / kill path.
-    // If we get the name right the method becomes a no-op (returns undefined/void).
-    var killWords = ["deny", "fail", "exit", "kill", "stop", "block", "revoke",
-                     "invalid", "illegal", "forbidden", "dontAllow", "notLicensed",
-                     "unlicensed", "reject", "terminate", "abort"];
-    lcNames.forEach(function (name) {
-      var lower = name.toLowerCase();
-      var isKillCandidate = killWords.some(function (w) {
-        return lower.indexOf(w) !== -1;
-      });
-      if (!isKillCandidate) return;
+    // Block every known kill / error / close path explicitly.
+    // Derived from the enumerated method list — "scheduleAppShutdown" was the
+    // primary kill path missed by a prior keyword-based approach.
+    var killMethods = [
+      "scheduleAppShutdown",
+      "createCloseAppIntentOrExitIfAppInBackground",
+      "startErrorDialogActivity",
+      "startPaywallActivity",
+      "retryOrThrow",
+      "handleError",
+      "handleTrialEnd",
+      "stopTrial",
+    ];
+    killMethods.forEach(function (name) {
       try {
         LicenseClient[name].overloads.forEach(function (ov) {
           ov.implementation = function () {
@@ -260,6 +263,24 @@ Java.perform(function () {
         });
       } catch (_) {}
     });
+
+    // Hook initializeLicenseCheck to immediately report success — prevents the
+    // check from ever contacting Google Play and reaching a fail state.
+    try {
+      LicenseClient.initializeLicenseCheck.overloads.forEach(function (ov) {
+        ov.implementation = function () {
+          console.log(
+            "== [PairIP bypass] initializeLicenseCheck → forcing reportSuccessfulLicenseCheck ==",
+          );
+          try {
+            this.reportSuccessfulLicenseCheck();
+          } catch (_) {
+            // reportSuccessfulLicenseCheck may need args on some builds;
+            // kill paths above are blocked as fallback.
+          }
+        };
+      });
+    } catch (_) {}
   } catch (_) {}
 
   // Block LicenseCheckException from propagating — PairIP may throw this
